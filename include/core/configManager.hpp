@@ -7,6 +7,6 @@ using namespace std;
 
 class configManager{
     public:
-        void loadConfigs();
-        void saveConfigs(vector<pair<int,string>> options);
+        static void loadConfigs(vector<pair<int,string>>& options,int flag);
+        static void saveConfigs(vector<pair<int,string>> options, int flag);
 };

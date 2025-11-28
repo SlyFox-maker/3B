@@ -1,5 +1,7 @@
 #include "ui/mainMenu.hpp"
 #include "core/configManager.hpp"
+#include "core/configNat.hpp"
+#include <core/deamonNFQWSManager.hpp>
 
 #include <iostream>
 #include <iostream>
@@ -13,6 +15,8 @@
 #include <fstream>
 #include <array>
 #include <map>
+#include <sys/wait.h>
+#include <filesystem>
 
 using namespace std;
 using namespace std::chrono_literals;
@@ -24,12 +28,15 @@ const string PINK  = "\033[38;2;255;105;180m";
 const string GRAY  = "\033[90m";
 const string YELLOW= "\033[33m";
 const string BOLD  = "\033[1m";
-
+const string RED   = "\033[31m";
+const string GREEN = "\033[32m";
 //Менюшки
 /*
     -1 - action
     -2 - folder
     -3 - title
+    -4 - config setting disable
+    -5 - config setting enable
 
     100 - main menu
     200 - config menu
@@ -39,7 +46,7 @@ const string BOLD  = "\033[1m";
 const vector<pair<int,string>> options = {
     {-3, "3B MENU"},
     {-2,"Configuration"},
-    {-2,"Test of connection"},
+    {-2,"Packets monitoring"},
     {-1, "Exit"}
 };
 
@@ -50,30 +57,30 @@ const vector<pair<int,string>> configOptions_1 = {
     {-2, "Back"}
 };
 
-const vector<pair<int,string>> configOptions_2 = {
+vector<pair<int,string>> configOptions_2 = {
     {-3, "nfqws Configuration"},
-    {-2, "DPI desynchronization attack"},
+    {-4, "DPI desynchronization attack"},
     {-2, "Fakes"},
-    {-2, "Modifications of fakes"},
-    {-2, "Overlapping SEQUENCE NUMBERS"},
-    {-2, "Assignment of IP_ID"},
-    {-2, "Specific IPV6 modes"},
-    {-2, "Modification of the original"},
-    {-2, "Duplicates"},
-    {-2, "Combining desynchronization methods"},
-    {-2, "IP cache"},
-    {-2, "DPI response to server reply"},
-    {-2, "Synack mode(Router only)"},
-    {-2, "Syndata mode"},
-    {-2, "CONNTRACK"},
-    {-2, "Reassembly"},
-    {-2, "UDP support"},
-    {-2, "IP fragmentation(old)"},
-    {-2, "Multiple strategies"},
-    {-2, "Filtering by wifi(No server)"},
-    {-2, "Iptables for nfqws"},
-    {-2, "Nftables для nfqws"},
-    {-2, "Flow offloading"},
+    {-4, "Modifications of fakes"},
+    {-4, "Overlapping SEQUENCE NUMBERS"},
+    {-4, "Assignment of IP_ID"},
+    {-4, "Specific IPV6 modes"},
+    {-4, "Modification of the original"},
+    {-4, "Duplicates"},
+    {-4, "Combining desynchronization methods"},
+    {-4, "IP cache"},
+    {-4, "DPI response to server reply"},
+    {-4, "Synack mode(Router only)"},
+    {-4, "Syndata mode"},
+    {-4, "CONNTRACK"},
+    {-4, "Reassembly"},
+    {-4, "UDP support"},
+    {-4, "IP fragmentation(old)"},
+    {-4, "Multiple strategies"},
+    {-4, "Filtering by wifi(No server)"},
+    {-4, "Iptables for nfqws"},
+    {-4, "Nftables для nfqws"},
+    {-4, "Flow offloading"},
     {-1, "Back"}
 };
 
@@ -122,8 +129,10 @@ string mainMenu::paintMenu(vector<pair<int,string>> options, int highlight){
 
         if(options[i].first == -1 || options[i].first == -2)
             line = options[i].second;
-        else
-            line = "[" + string(options[i].first == 1 ? "*" : " ") + "] " + options[i].second;
+        else if(options[i].first == -4)
+            line = "[ ] " + options[i].second;
+        else if(options[i].first == -5)
+            line = CYAN + "[X] " + options[i].second;
 
         // Подсветка активного пункта
         if (i == highlight)
@@ -141,6 +150,12 @@ string mainMenu::paintMenu(vector<pair<int,string>> options, int highlight){
 vector<pair<int,string>> mainMenu::configCommandHandler(vector<pair<int,string>> option, int current_option){
     if(option[current_option].second == "nfqws"){
         return allMenus[210];
+    }
+    else if(option[0].second == "nfqws Configuration"){
+        //Сохранение включений конфигов
+        option[current_option].first = option[current_option].first == -4 ? -5 : -4;
+        configManager::saveConfigs(option, 100);
+        cout<<current_option<< "DFDF" << endl;
     }
     return option;
 }
@@ -165,14 +180,30 @@ void mainMenu::startMenu(){
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &newt);
 
     system("clear");
-    cout << CYAN << "App is running..." << RESET << endl;
-    this_thread::sleep_for(800ms);
+    cout << CYAN << "Making rules for NAT..." << RESET << endl;
+    configNat natConfig;
+    if(natConfig.startConfigNat() != 0){
+        cerr << RED << "Failed to setup NAT. Exiting..." << RESET << endl;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+        return;
+    }
+
+    // starting daemon
+    deamonNFQWSManager* daemonManager = new deamonNFQWSManager();
+    if(daemonManager->startDeamon() !=0){
+        cerr << RED << "Failed to start nfqws daemon. Exiting..." << RESET << endl;
+        natConfig.stopConfigNat();
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
+        return;
+    }
+    cout << CYAN << "Daemon started with succefully " << RESET << endl;
+
+    this_thread::sleep_for(5000ms);
     system("clear");
 
     //Loading of configs
-            
-            
-
+    //nfqws configs
+    configManager::loadConfigs(allMenus[210], 100);
     //Show main menu
 
 
@@ -241,6 +272,15 @@ void mainMenu::startMenu(){
         }
         system("clear");
     }
+
+    //Restore nat tables:
+    natConfig.stopConfigNat();
+
+    cout << YELLOW << "Stopping daemon..." << RESET << endl;
+    daemonManager->sendCommand("exit");
+    daemonManager->stopDeamon();
+    cout << GREEN << "Daemon stopped." << RESET << endl;
+
 
     cout << RESET << "Bye.\n";
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &oldt);
