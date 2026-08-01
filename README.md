@@ -45,6 +45,7 @@ sudo ./start.sh
 ```bash
 cp strategies/whatsapp.conf.example strategies/whatsapp.conf
 cp ipsets/whatsapp-ips.txt.example ipsets/whatsapp-ips.txt
+cp hostlists/whatsapp.txt.example hostlists/whatsapp.txt
 mkdir -p files/fake
 ```
 
@@ -53,9 +54,6 @@ mkdir -p files/fake
 ```bash
 curl -L -o files/fake/quic_initial_www_google_com.bin \
   https://raw.githubusercontent.com/bol-van/zapret/master/files/fake/quic_initial_www_google_com.bin
-
-curl -L -o files/fake/4pda.bin \
-  https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/refs/heads/main/bin/tls_clienthello_4pda_to.bin
 ```
 
 Затем запустите:
@@ -93,7 +91,7 @@ sudo tail -F /var/log/nfqws.log
 
 Подробную отладку `--debug=1` следует включать только временно: при большом объёме трафика лог быстро растёт и обработка может замедлиться.
 
-Скрипт исключает пакеты с fwmark `0x40000000`, чтобы созданные `nfqws` fake-пакеты не попадали в очередь повторно. В `NFQUEUE` направляются только первые 20 исходящих пакетов соединения; лимиты задаются переменными `NFQWS_TCP_PACKET_LIMIT` и `NFQWS_UDP_PACKET_LIMIT`.
+Скрипт исключает пакеты с fwmark `0x40000000`, чтобы созданные `nfqws` fake-пакеты не попадали в очередь повторно. По умолчанию в `NFQUEUE` направляются первые 64 исходящих TCP-пакета и 32 UDP-пакета соединения; лимиты задаются переменными `NFQWS_TCP_PACKET_LIMIT` и `NFQWS_UDP_PACKET_LIMIT`.
 
 ## Благодарности
 
