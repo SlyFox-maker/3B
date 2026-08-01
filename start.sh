@@ -8,8 +8,12 @@
 NFQWS_BIN="./nfqws"
 QUEUE_NUM=29
 LOG_FILE="/var/log/nfqws.log"
+PID_FILE="/run/3b-nfqws.pid"
 STRATEGIES_DIR="./strategies"
 HOSTLISTS_DIR="./hostlists"
+NFQWS_TCP_PORTS="80,443,5222"
+NFQWS_UDP_PORTS="443,590:1400,3478,3482"
+IPTABLES_CHAIN="THREEB_NFQWS"
 
 # --- Не менять ниже этой линии ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,18 +58,26 @@ echo ""
 # 1. Остановка запущенных процессов
 # ============================================================================
 echo "[1/4] Остановка предыдущих процессов"
-echo "Поиск активных процессов nfqws..."
+echo "Проверка PID-файла ${PID_FILE}..."
 
-RUNNING_COUNT=$(pgrep -f "nfqws" 2>/dev/null | wc -l)
-
-if [ "${RUNNING_COUNT}" -gt 0 ]; then
-    echo "Найдено процессов: ${RUNNING_COUNT}"
-    sudo pkill -f "nfqws" 2>/dev/null
-    sleep 3
-    echo "Процессы остановлены"
-else
-    echo "Активных процессов нет"
+PREVIOUS_PID=""
+if sudo test -f "${PID_FILE}"; then
+    PREVIOUS_PID=$(sudo cat "${PID_FILE}" 2>/dev/null)
 fi
+
+if [[ "${PREVIOUS_PID}" =~ ^[0-9]+$ ]] && sudo kill -0 "${PREVIOUS_PID}" 2>/dev/null; then
+    PROCESS_NAME=$(ps -p "${PREVIOUS_PID}" -o comm= 2>/dev/null | xargs)
+    if [ "${PROCESS_NAME}" = "nfqws" ]; then
+        sudo kill "${PREVIOUS_PID}"
+        sleep 2
+        echo "Процесс ${PREVIOUS_PID} остановлен"
+    else
+        echo "PID ${PREVIOUS_PID} принадлежит ${PROCESS_NAME}, пропускаем"
+    fi
+else
+    echo "Управляемый процесс не найден"
+fi
+sudo rm -f "${PID_FILE}" 2>/dev/null
 
 echo "Очистка временных конфигов..."
 sudo rm -f /tmp/3b_nfqws_*.conf 2>/dev/null
@@ -73,26 +85,19 @@ echo "Временные конфиги удалены"
 echo ""
 
 # ============================================================================
-# 2. Очистка iptables
+# 2. Подготовка собственной цепочки iptables
 # ============================================================================
-echo "[2/4] Очистка сетевых правил"
+echo "[2/4] Подготовка сетевых правил"
 
-TABLES_CLEANED=0
-for table in mangle raw; do
-    echo "Очистка таблицы ${table}"
+if ! sudo iptables -t mangle -N "${IPTABLES_CHAIN}" 2>/dev/null; then
+    sudo iptables -t mangle -F "${IPTABLES_CHAIN}" || exit 1
+fi
 
-    if sudo iptables -t ${table} -F 2>/dev/null; then
-        sudo iptables -t ${table} -X 2>/dev/null
-        TABLES_CLEANED=$((TABLES_CLEANED + 1))
-    fi
+if ! sudo iptables -t mangle -C OUTPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; then
+    sudo iptables -t mangle -I OUTPUT 1 -j "${IPTABLES_CHAIN}" || exit 1
+fi
 
-    if sudo ip6tables -t ${table} -F 2>/dev/null; then
-        sudo ip6tables -t ${table} -X 2>/dev/null
-        TABLES_CLEANED=$((TABLES_CLEANED + 1))
-    fi
-done
-
-echo "Очищено таблиц: ${TABLES_CLEANED}"
+echo "Цепочка готова: ${IPTABLES_CHAIN}"
 echo ""
 
 # ============================================================================
@@ -103,32 +108,41 @@ echo "[3/4] Настройка перенаправления трафика"
 echo "Добавление исключений..."
 
 SSH_RULES=0
-if sudo iptables -t mangle -I OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
-if sudo iptables -t mangle -I OUTPUT -p tcp --dport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
+if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p tcp --sport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
+if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p tcp --dport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
 echo "Правила SSH: ${SSH_RULES}"
 
 DNS_RULES=0
 for proto in tcp udp; do
-    if sudo iptables -t mangle -I OUTPUT -p ${proto} --sport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
-    if sudo iptables -t mangle -I OUTPUT -p ${proto} --dport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
+    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p "${proto}" --sport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
+    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p "${proto}" --dport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
 done
 echo "Правила DNS: ${DNS_RULES}"
 
 LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
 LOCAL_COUNT=0
 for net in ${LOCAL_NETS}; do
-    if sudo iptables -t mangle -I OUTPUT -d ${net} -j RETURN 2>/dev/null; then LOCAL_COUNT=$((LOCAL_COUNT + 1)); fi
+    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -d "${net}" -j RETURN 2>/dev/null; then LOCAL_COUNT=$((LOCAL_COUNT + 1)); fi
 done
 echo "Локальные сети: ${LOCAL_COUNT}"
 
 MAIN_RULES=0
-if sudo iptables -t mangle -A OUTPUT -p tcp -j NFQUEUE --queue-num ${QUEUE_NUM}; then MAIN_RULES=$((MAIN_RULES + 1)); fi
-if sudo iptables -t mangle -A OUTPUT -p udp -j NFQUEUE --queue-num ${QUEUE_NUM}; then MAIN_RULES=$((MAIN_RULES + 1)); fi
+if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
+    -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" \
+    -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
+    MAIN_RULES=$((MAIN_RULES + 1))
+fi
+
+if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
+    -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" \
+    -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
+    MAIN_RULES=$((MAIN_RULES + 1))
+fi
 echo "Основные правила: ${MAIN_RULES}"
 
 echo ""
-echo "Текущее состояние (iptables -t mangle -L OUTPUT):"
-sudo iptables -t mangle -L OUTPUT -n --line-numbers | tail -15
+echo "Текущее состояние цепочки ${IPTABLES_CHAIN}:"
+sudo iptables -t mangle -L "${IPTABLES_CHAIN}" -n --line-numbers
 echo ""
 
 # ============================================================================
@@ -142,6 +156,7 @@ echo "Временный конфиг: ${TEMP_CONFIG}"
 {
     echo "--qnum=${QUEUE_NUM}"
     echo "--daemon"
+    echo "--pidfile=${PID_FILE}"
 } > "${TEMP_CONFIG}"
 
 STRATEGY_COUNT=0
@@ -203,6 +218,15 @@ RETRY_COUNT=0
 
 while [[ -z "${ACTUAL_PID}" && "${RETRY_COUNT}" -lt "${MAX_RETRIES}" ]]; do
     sleep 1
-    ACTUAL_PID=$(pgrep -f "nfqws.*${QUEUE_NUM}" 2>/dev/null)
+    if sudo test -f "${PID_FILE}"; then
+        ACTUAL_PID=$(sudo cat "${PID_FILE}" 2>/dev/null)
+    fi
     RETRY_COUNT=$((RETRY_COUNT + 1))
 done
+
+if [[ "${ACTUAL_PID}" =~ ^[0-9]+$ ]] && sudo kill -0 "${ACTUAL_PID}" 2>/dev/null; then
+    echo "nfqws запущен, PID: ${ACTUAL_PID}"
+else
+    echo "Ошибка: nfqws не запустился. Проверьте ${LOG_FILE}"
+    exit 1
+fi

@@ -1,0 +1,28 @@
+# WhatsApp QUIC
+--new
+--filter-udp=443
+--ipset=./ipsets/whatsapp-ips.txt
+--dpi-desync=fake
+--dpi-desync-repeats=2
+--dpi-desync-any-protocol
+--dpi-desync-cutoff=d4
+--dpi-desync-fake-quic=@./files/fake/quic_initial_www_google_com.bin
+--comment="WhatsApp QUIC"
+
+# WhatsApp TLS and messaging
+--new
+--filter-tcp=443,5222
+--ipset=./ipsets/whatsapp-ips.txt
+--dpi-desync=split2
+--dpi-desync-split-seqovl=681
+--dpi-desync-split-pos=1,midsld
+--dpi-desync-split-seqovl-pattern=@./files/fake/4pda.bin
+--comment="WhatsApp TCP"
+
+# WhatsApp calls (STUN)
+--new
+--filter-udp=590-1400,3478,3482
+--filter-l7=stun
+--ipset=./ipsets/whatsapp-ips.txt
+--dpi-desync=fake
+--comment="WhatsApp STUN"

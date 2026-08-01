@@ -1,4 +1,5 @@
-# Стратегия 1: YouTube TCP
+# YouTube TCP
+--new
 --filter-tcp=80,443
 --hostlist=./hostlists/youtube.txt
 --dpi-desync=multisplit
@@ -6,10 +7,20 @@
 --dpi-desync-split-pos=midsld-1
 --comment="YouTube TCP"
 
+# YouTube QUIC
 --new
-# Стратегия 2: YouTube QUIC (UDP)
 --filter-udp=443
 --hostlist=./hostlists/youtube.txt
 --dpi-desync=fake
 --dpi-desync-repeats=11
 --comment="YouTube QUIC"
+
+# YouTube video hosts
+--new
+--filter-tcp=443
+--hostlist-domains=googlevideo.com
+--dpi-desync=fake,fakeddisorder
+--dpi-desync-fooling=datanoack
+--dpi-desync-split-pos=midsld
+--dpi-desync-fake-tls=0x00000000
+--comment="YouTube Video"

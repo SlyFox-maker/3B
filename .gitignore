@@ -1,2 +1,13 @@
+/.vscode/
 /3B\ configurator/
-.vscode/
+*.log
+*.pid
+*.tmp
+strategies/*.conf
+hostlists/*.txt
+ipsets/*.txt
+files/fake/*.bin
+!strategies/*.conf.example
+!hostlists/*.txt.example
+!ipsets/*.txt.example
+!files/fake/.gitkeep
