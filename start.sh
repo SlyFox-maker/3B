@@ -13,6 +13,9 @@ STRATEGIES_DIR="./strategies"
 HOSTLISTS_DIR="./hostlists"
 NFQWS_TCP_PORTS="80,443,5222"
 NFQWS_UDP_PORTS="443,590:1400,3478,3482"
+NFQWS_FWMARK="0x40000000/0x40000000"
+NFQWS_TCP_PACKET_LIMIT=20
+NFQWS_UDP_PACKET_LIMIT=20
 IPTABLES_CHAIN="THREEB_NFQWS"
 
 # --- Не менять ниже этой линии ---
@@ -126,19 +129,39 @@ for net in ${LOCAL_NETS}; do
 done
 echo "Локальные сети: ${LOCAL_COUNT}"
 
+FWMARK_RULES=0
+if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
+    -m mark --mark "${NFQWS_FWMARK}" -j RETURN 2>/dev/null; then
+    FWMARK_RULES=$((FWMARK_RULES + 1))
+fi
+echo "Исключения fwmark: ${FWMARK_RULES}"
+if [ "${FWMARK_RULES}" -ne 1 ]; then
+    echo "Ошибка: не удалось добавить исключение fwmark ${NFQWS_FWMARK}."
+    exit 1
+fi
+
 MAIN_RULES=0
 if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
     -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" \
+    -m connbytes --connbytes "1:${NFQWS_TCP_PACKET_LIMIT}" \
+    --connbytes-dir original --connbytes-mode packets \
     -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
     MAIN_RULES=$((MAIN_RULES + 1))
 fi
 
 if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
     -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" \
+    -m connbytes --connbytes "1:${NFQWS_UDP_PACKET_LIMIT}" \
+    --connbytes-dir original --connbytes-mode packets \
     -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
     MAIN_RULES=$((MAIN_RULES + 1))
 fi
 echo "Основные правила: ${MAIN_RULES}"
+if [ "${MAIN_RULES}" -ne 2 ]; then
+    echo "Ошибка: не удалось добавить правила NFQUEUE с connbytes."
+    echo "Проверьте поддержку модулей xt_connbytes и nfnetlink_queue."
+    exit 1
+fi
 
 echo ""
 echo "Текущее состояние цепочки ${IPTABLES_CHAIN}:"
