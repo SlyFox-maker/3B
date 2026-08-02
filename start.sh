@@ -16,8 +16,6 @@ HOSTLISTS_DIR="./hostlists"
 NFQWS_TCP_PORTS="80,443,5222,5242"
 NFQWS_UDP_PORTS="443,3478,590:65535"
 NFQWS_FWMARK="0x40000000/0x40000000"
-NFQWS_TCP_PACKET_LIMIT=64
-NFQWS_UDP_PACKET_LIMIT=32
 IPTABLES_CHAIN="THREEB_NFQWS"
 NFQWS_TRACE="${NFQWS_TRACE:-1}"
 NFQWS_FAKE_SNI="${NFQWS_FAKE_SNI:-dzen.ru}"
@@ -188,23 +186,19 @@ fi
 MAIN_RULES=0
 if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
     -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" \
-    -m connbytes --connbytes "1:${NFQWS_TCP_PACKET_LIMIT}" \
-    --connbytes-dir original --connbytes-mode packets \
     -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
     MAIN_RULES=$((MAIN_RULES + 1))
 fi
 
 if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
     -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" \
-    -m connbytes --connbytes "1:${NFQWS_UDP_PACKET_LIMIT}" \
-    --connbytes-dir original --connbytes-mode packets \
     -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
     MAIN_RULES=$((MAIN_RULES + 1))
 fi
 echo "Основные правила: ${MAIN_RULES}"
 if [ "${MAIN_RULES}" -ne 2 ]; then
-    echo "Ошибка: не удалось добавить правила NFQUEUE с connbytes."
-    echo "Проверьте поддержку модулей xt_connbytes и nfnetlink_queue."
+    echo "Ошибка: не удалось добавить правила NFQUEUE."
+    echo "Проверьте поддержку модуля nfnetlink_queue."
     exit 1
 fi
 
