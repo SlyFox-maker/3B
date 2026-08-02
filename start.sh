@@ -19,7 +19,8 @@ NFQWS_FWMARK="0x40000000/0x40000000"
 NFQWS_TCP_PACKET_LIMIT=64
 NFQWS_UDP_PACKET_LIMIT=32
 IPTABLES_CHAIN="THREEB_NFQWS"
-NFQWS_TRACE="${NFQWS_TRACE:-0}"
+NFQWS_TRACE="${NFQWS_TRACE:-1}"
+NFQWS_FAKE_SNI="${NFQWS_FAKE_SNI:-dzen.ru}"
 
 # --- Не менять ниже этой линии ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,6 +97,7 @@ echo "==============================================="
 echo "Queue: ${QUEUE_NUM}"
 echo "Log: ${LOG_FILE}"
 echo "Trace: ${NFQWS_TRACE}"
+echo "Fake SNI: ${NFQWS_FAKE_SNI}"
 echo "Стратегии: ${ACTIVE_STRATEGIES}"
 echo "==============================================="
 echo ""
@@ -236,7 +238,19 @@ for strategy in ${ACTIVE_STRATEGIES}; do
         STRATEGY_COUNT=$((STRATEGY_COUNT + 1))
         echo "" >> "${TEMP_CONFIG}"
         echo "# Strategy: ${strategy}" >> "${TEMP_CONFIG}"
-        grep -v '^#' "${CONFIG_FILE}" | grep -v '^$' >> "${TEMP_CONFIG}"
+        if [ "${STRATEGY_COUNT}" -gt 1 ]; then
+            echo "--new" >> "${TEMP_CONFIG}"
+        fi
+        awk '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            {
+                if (first_option == "") {
+                    first_option=1
+                    if ($0 == "--new") next
+                }
+                print
+            }
+        ' "${CONFIG_FILE}" >> "${TEMP_CONFIG}"
         echo "Стратегия загружена: ${strategy}"
     fi
 done
@@ -246,6 +260,18 @@ if [ "${STRATEGY_COUNT}" -eq 0 ]; then
     rm -f "${TEMP_CONFIG}"
     exit 1
 fi
+
+if [[ ! "${NFQWS_FAKE_SNI}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    echo "Ошибка: недопустимое значение NFQWS_FAKE_SNI=${NFQWS_FAKE_SNI}"
+    rm -f "${TEMP_CONFIG}"
+    exit 1
+fi
+
+sed -i -E \
+    -e "s/sni=<FAKE_SNI>/sni=${NFQWS_FAKE_SNI}/g" \
+    -e "s/rndsni/sni=${NFQWS_FAKE_SNI}/g" \
+    -e "s/sni=[A-Za-z0-9.-]+/sni=${NFQWS_FAKE_SNI}/g" \
+    "${TEMP_CONFIG}"
 
 echo ""
 echo "Предпросмотр:"
