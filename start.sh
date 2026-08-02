@@ -7,8 +7,10 @@
 # --- Конфигурация (меняйте здесь) ---
 NFQWS_BIN="./nfqws"
 QUEUE_NUM=29
-LOG_FILE="/var/log/nfqws.log"
+LOG_MAX_BYTES=209715200
 PID_FILE="/run/3b-nfqws.pid"
+LOG_MAINTAINER_PID_FILE="/run/3b-log-maintainer.pid"
+LOG_ROUTER_PID_FILE="/run/3b-log-router.pid"
 STRATEGIES_DIR="./strategies"
 HOSTLISTS_DIR="./hostlists"
 NFQWS_TCP_PORTS="80,443,5222,5242"
@@ -17,10 +19,46 @@ NFQWS_FWMARK="0x40000000/0x40000000"
 NFQWS_TCP_PACKET_LIMIT=64
 NFQWS_UDP_PACKET_LIMIT=32
 IPTABLES_CHAIN="THREEB_NFQWS"
+NFQWS_TRACE="${NFQWS_TRACE:-0}"
 
 # --- Не менять ниже этой линии ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}" || exit 1
+LOG_DIR="${SCRIPT_DIR}/logs"
+PROFILE_LOG_DIR="${LOG_DIR}/profiles"
+LOG_FILE="${LOG_DIR}/nfqws.log"
+DEBUG_LOG="${LOG_DIR}/nfqws-debug.log"
+PROFILE_MAP="${LOG_DIR}/profile-map.tsv"
+mkdir -p "${PROFILE_LOG_DIR}"
+
+start_helper() {
+    local script_path="$1"
+    local pid_file="$2"
+    shift 2
+
+    if sudo test -f "${pid_file}"; then
+        local old_pid
+        old_pid=$(sudo cat "${pid_file}" 2>/dev/null)
+        if [[ "${old_pid}" =~ ^[0-9]+$ ]]; then
+            sudo kill "${old_pid}" 2>/dev/null || true
+        fi
+        sudo rm -f "${pid_file}"
+    fi
+
+    sudo nohup "${script_path}" "${pid_file}" "$@" >/dev/null 2>&1 &
+}
+
+stop_helper() {
+    local pid_file="$1"
+    if sudo test -f "${pid_file}"; then
+        local helper_pid
+        helper_pid=$(sudo cat "${pid_file}" 2>/dev/null)
+        if [[ "${helper_pid}" =~ ^[0-9]+$ ]]; then
+            sudo kill "${helper_pid}" 2>/dev/null || true
+        fi
+        sudo rm -f "${pid_file}"
+    fi
+}
 
 # ============================================================================
 # Сканирование стратегий
@@ -47,12 +85,17 @@ else
     exit 1
 fi
 
+stop_helper "${LOG_ROUTER_PID_FILE}"
+start_helper "${SCRIPT_DIR}/scripts/log-maintainer.sh" \
+    "${LOG_MAINTAINER_PID_FILE}" "${LOG_DIR}" "${LOG_MAX_BYTES}"
+
 clear
 echo "==============================================="
 echo "          3B DPI BYPASS SYSTEM v2.0"
 echo "==============================================="
 echo "Queue: ${QUEUE_NUM}"
 echo "Log: ${LOG_FILE}"
+echo "Trace: ${NFQWS_TRACE}"
 echo "Стратегии: ${ACTIVE_STRATEGIES}"
 echo "==============================================="
 echo ""
@@ -180,6 +223,9 @@ echo "Временный конфиг: ${TEMP_CONFIG}"
     echo "--qnum=${QUEUE_NUM}"
     echo "--daemon"
     echo "--pidfile=${PID_FILE}"
+    if [ "${NFQWS_TRACE}" = "1" ]; then
+        echo "--debug=@${DEBUG_LOG}"
+    fi
 } > "${TEMP_CONFIG}"
 
 STRATEGY_COUNT=0
@@ -206,6 +252,45 @@ echo "Предпросмотр:"
 cat "${TEMP_CONFIG}"
 echo ""
 
+echo "Карта профилей:"
+awk '
+    function begin_profile() {
+        if (!started) {
+            profile=1
+            started=1
+            printf "\nПрофиль %d [%s]", profile, source
+        }
+    }
+    /^# Strategy:/ { source=$0; sub(/^# Strategy:[[:space:]]*/, "", source) }
+    /^--new$/ {
+        if (started) profile++; else { profile=1; started=1 }
+        printf "\nПрофиль %d [%s]", profile, source
+    }
+    /^--comment=/ { begin_profile(); printf " | %s", $0 }
+    /^--filter-(tcp|udp|l7|l3)=/ || /^--(hostlist|hostlist-domains|ipset)=/ {
+        begin_profile()
+        printf "\n  %s", $0
+    }
+    END { print "" }
+' "${TEMP_CONFIG}"
+echo ""
+
+awk '
+    function register_profile() {
+        if (!started) { profile=1; started=1 }
+        if (!(profile in saved)) {
+            print profile "\t" source
+            saved[profile]=1
+        }
+    }
+    /^# Strategy:/ { source=$0; sub(/^# Strategy:[[:space:]]*/, "", source) }
+    /^--new$/ {
+        if (started) profile++; else { profile=1; started=1 }
+        register_profile()
+    }
+    /^--filter-(tcp|udp|l7|l3)=/ { register_profile() }
+' "${TEMP_CONFIG}" > "${PROFILE_MAP}"
+
 echo "Проверка hostlist файлов..."
 
 MISSING_FILES=0
@@ -231,6 +316,13 @@ echo "Запуск nfqws..."
 sudo touch "${LOG_FILE}"
 sudo chmod 644 "${LOG_FILE}"
 
+if [ "${NFQWS_TRACE}" = "1" ]; then
+    sudo touch "${DEBUG_LOG}"
+    sudo chmod 644 "${DEBUG_LOG}"
+    sudo truncate -s 0 "${DEBUG_LOG}"
+    echo "Подробная трассировка: ${DEBUG_LOG}"
+fi
+
 sudo "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${LOG_FILE}" 2>&1
 sleep 3
 
@@ -249,6 +341,11 @@ done
 
 if [[ "${ACTUAL_PID}" =~ ^[0-9]+$ ]] && sudo kill -0 "${ACTUAL_PID}" 2>/dev/null; then
     echo "nfqws запущен, PID: ${ACTUAL_PID}"
+    if [ "${NFQWS_TRACE}" = "1" ]; then
+        start_helper "${SCRIPT_DIR}/scripts/profile-log-router.sh" \
+            "${LOG_ROUTER_PID_FILE}" "${DEBUG_LOG}" "${PROFILE_MAP}" "${PROFILE_LOG_DIR}"
+        echo "Логи профилей: ${PROFILE_LOG_DIR}"
+    fi
 else
     echo "Ошибка: nfqws не запустился. Проверьте ${LOG_FILE}"
     exit 1
