@@ -135,6 +135,19 @@ echo ""
 # ============================================================================
 echo "[2/4] Подготовка сетевых правил"
 
+LEGACY_RULES_REMOVED=0
+while IFS= read -r legacy_rule; do
+    if [[ "${legacy_rule}" == *"-j NFQUEUE"* ]] && \
+       [[ "${legacy_rule}" == *"--queue-num ${QUEUE_NUM}"* ]]; then
+        read -r -a legacy_args <<< "${legacy_rule}"
+        legacy_args[0]="-D"
+        if sudo iptables -t mangle "${legacy_args[@]}"; then
+            LEGACY_RULES_REMOVED=$((LEGACY_RULES_REMOVED + 1))
+        fi
+    fi
+done < <(sudo iptables -t mangle -S OUTPUT)
+echo "Удалено старых прямых правил NFQUEUE ${QUEUE_NUM}: ${LEGACY_RULES_REMOVED}"
+
 if ! sudo iptables -t mangle -N "${IPTABLES_CHAIN}" 2>/dev/null; then
     sudo iptables -t mangle -F "${IPTABLES_CHAIN}" || exit 1
 fi
@@ -341,6 +354,9 @@ if [ "${NFQWS_TRACE}" = "1" ]; then
     sudo touch "${DEBUG_LOG}"
     sudo chmod 644 "${DEBUG_LOG}"
     sudo truncate -s 0 "${DEBUG_LOG}"
+    while IFS= read -r -d '' profile_log; do
+        sudo truncate -s 0 "${profile_log}"
+    done < <(find "${PROFILE_LOG_DIR}" -type f -name '*.log' -print0 2>/dev/null)
     echo "Подробная трассировка: ${DEBUG_LOG}"
 fi
 
