@@ -217,10 +217,11 @@ echo "Временный конфиг: ${TEMP_CONFIG}"
 
 {
     echo "--qnum=${QUEUE_NUM}"
-    echo "--daemon"
     echo "--pidfile=${PID_FILE}"
     if [ "${NFQWS_TRACE}" = "1" ]; then
-        echo "--debug=@${DEBUG_LOG}"
+        echo "--debug=1"
+    else
+        echo "--daemon"
     fi
 } > "${TEMP_CONFIG}"
 
@@ -343,7 +344,11 @@ if [ "${NFQWS_TRACE}" = "1" ]; then
     echo "Подробная трассировка: ${DEBUG_LOG}"
 fi
 
-sudo "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${LOG_FILE}" 2>&1
+if [ "${NFQWS_TRACE}" = "1" ]; then
+    sudo nohup "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${DEBUG_LOG}" 2>&1 &
+else
+    sudo "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${LOG_FILE}" 2>&1
+fi
 sleep 3
 
 # Проверка запуска
