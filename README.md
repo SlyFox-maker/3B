@@ -80,6 +80,8 @@ sudo ./start.sh
 
 `nfqws2` получает начало соединения в обоих направлениях. Лимиты задаются через `NFQWS2_TCP_PKT_OUT`, `NFQWS2_TCP_PKT_IN`, `NFQWS2_UDP_PKT_OUT` и `NFQWS2_UDP_PKT_IN`. Это позволяет Lua-стратегиям анализировать ответы и не отправлять всё соединение в userspace.
 
+При старте Lua, hostlist, ipset и fake-файлы копируются в `/run/3b-nfqws2-runtime`. `nfqws2` сбрасывает root-права, поэтому не смог бы загрузить их напрямую из домашнего каталога с правами `700`.
+
 ## Управление
 
 Повторный запуск безопасно останавливает управляемый процесс и пересоздаёт собственные цепочки. Полная остановка:
@@ -115,7 +117,33 @@ sudo ./test-strategies.sh youtube.com googlevideo.com
 
 Без аргументов тестер интерактивно спросит домены. Параметры поиска задаются в `.env`: `STRATEGY_TEST_LEVEL=quick|standard|force`, `STRATEGY_TEST_REPEATS`, `STRATEGY_TEST_IPV`, `STRATEGY_TEST_PARALLEL` и `STRATEGY_TEST_BATCH`.
 
+Чтобы тестировать домен через конкретный доступный frontend, не меняя SNI, предзаполните DNS-кэш tester-а:
+
+```dotenv
+STRATEGY_TEST_IP_OVERRIDES="whatsapp.com=57.144.251.32 web.whatsapp.com=57.144.251.32"
+```
+
 Результаты поколений несовместимы: вывод nfqws1 переносится в `strategies/`, вывод nfqws2 — в `strategies2/`. После теста основной сервис намеренно остаётся остановленным, чтобы не запустить автоматически ещё не проверенную стратегию.
+
+После успешного завершения `SUMMARY` автоматически разбирается в `logs/tests/results/nfqwsN-ДАТА-ВРЕМЯ/`:
+
+```text
+domains/<domain>/tls12-ipv4.candidate.conf  первая стабильная кандидатура
+domains/<domain>/tls12-ipv4.all.conf        все успешные стратегии домена
+common/tls12-ipv4.candidate.conf            готовый общий кандидат для всех доменов
+common/tls12-ipv4.all.conf                  все стратегии, общие для всех доменов
+index.tsv                                   единый поисковый индекс
+README.txt                                  описание отчёта
+```
+
+Кандидаты не активируются автоматически: успешная стратегия `curl` ещё должна быть просмотрена и проверена реальным приложением. Нужный `.candidate.conf` можно скопировать в `strategies/` или `strategies2/`, после чего запустить `sudo ./start.sh`.
+
+Удобный просмотр последнего отчёта:
+
+```bash
+./show-strategies.sh
+./show-strategies.sh youtube.com
+```
 
 ## Диагностика
 

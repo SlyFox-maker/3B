@@ -27,6 +27,7 @@ LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"
 NFQWS1_BIN="${NFQWS1_BIN:-${SCRIPT_DIR}/vendor/zapret1/nfq/nfqws}"
 NFQWS2_ROOT="${NFQWS2_ROOT:-${SCRIPT_DIR}/vendor/zapret2}"
 NFQWS2_BIN="${NFQWS2_BIN:-${NFQWS2_ROOT}/nfq2/nfqws2}"
+NFQWS2_RUNTIME_ROOT="${NFQWS2_RUNTIME_ROOT:-/run/3b-nfqws2-runtime}"
 NFQWS_FWMARK="0x40000000/0x40000000"
 NFQWS_FWMARK_VALUE="0x40000000"
 OUT_CHAIN="THREEB_NFQWS_OUT"
@@ -139,6 +140,22 @@ helper_stop "${ROUTER_PID_FILE}"
 remove_firewall
 remove_legacy_direct_rules
 
+if [[ "${NFQWS_ENGINE}" == "2" ]]; then
+    # nfqws2 drops root before loading Lua/lists. Stage runtime assets outside a
+    # potentially mode-700 home directory while keeping the source tree private.
+    sudo install -d -m 0755 \
+        "${NFQWS2_RUNTIME_ROOT}" \
+        "${NFQWS2_RUNTIME_ROOT}/lua" \
+        "${NFQWS2_RUNTIME_ROOT}/hostlists" \
+        "${NFQWS2_RUNTIME_ROOT}/ipsets" \
+        "${NFQWS2_RUNTIME_ROOT}/files/fake"
+    sudo cp -a "${NFQWS2_ROOT}/lua/." "${NFQWS2_RUNTIME_ROOT}/lua/"
+    sudo cp -a "${SCRIPT_DIR}/hostlists/." "${NFQWS2_RUNTIME_ROOT}/hostlists/"
+    sudo cp -a "${SCRIPT_DIR}/ipsets/." "${NFQWS2_RUNTIME_ROOT}/ipsets/"
+    sudo cp -a "${SCRIPT_DIR}/files/fake/." "${NFQWS2_RUNTIME_ROOT}/files/fake/"
+    sudo chmod -R a+rX "${NFQWS2_RUNTIME_ROOT}"
+fi
+
 TEMP_CONFIG="$(mktemp /tmp/3b_nfqws_XXXXXX.conf)"
 {
     printf '%s\n' "--qnum=${QUEUE_NUM}" "--pidfile=${PID_FILE}"
@@ -149,7 +166,11 @@ TEMP_CONFIG="$(mktemp /tmp/3b_nfqws_XXXXXX.conf)"
     fi
     [[ "${NFQWS_TRACE}" == "1" ]] && printf '%s\n' '--debug=1' || printf '%s\n' '--daemon'
     if [[ "${NFQWS_ENGINE}" == "2" ]]; then
-        printf '%s\n' "--lua-init=@${NFQWS2_ROOT}/lua/zapret-lib.lua" "--lua-init=@${NFQWS2_ROOT}/lua/zapret-antidpi.lua" "--lua-init=@${NFQWS2_ROOT}/lua/zapret-auto.lua"
+        printf '%s\n' \
+            "--chdir=${NFQWS2_RUNTIME_ROOT}" \
+            "--lua-init=@${NFQWS2_RUNTIME_ROOT}/lua/zapret-lib.lua" \
+            "--lua-init=@${NFQWS2_RUNTIME_ROOT}/lua/zapret-antidpi.lua" \
+            "--lua-init=@${NFQWS2_RUNTIME_ROOT}/lua/zapret-auto.lua"
     fi
 } > "${TEMP_CONFIG}"
 
