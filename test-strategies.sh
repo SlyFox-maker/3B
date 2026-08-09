@@ -21,11 +21,15 @@ TEST_IPV="${STRATEGY_TEST_IPV:-4}"
 TEST_DOMAINS="${STRATEGY_TEST_DOMAINS:-}"
 TEST_CURL_MAX_TIME="${STRATEGY_TEST_CURL_MAX_TIME:-3}"
 TEST_IP_OVERRIDES="${STRATEGY_TEST_IP_OVERRIDES:-}"
+TEST_PROGRESS="${STRATEGY_TEST_PROGRESS:-1}"
+TEST_STOP_AFTER_FOUND="${STRATEGY_TEST_STOP_AFTER_FOUND:-0}"
 
 die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 [[ "${NFQWS_ENGINE}" == "1" || "${NFQWS_ENGINE}" == "2" ]] || die "NFQWS_ENGINE должен быть 1 или 2"
 [[ "${TEST_REPEATS}" =~ ^[1-9][0-9]*$ ]] || die "STRATEGY_TEST_REPEATS должен быть положительным числом"
 [[ "${TEST_LEVEL}" == "quick" || "${TEST_LEVEL}" == "standard" || "${TEST_LEVEL}" == "force" ]] || die "STRATEGY_TEST_LEVEL должен быть quick, standard или force"
+[[ "${TEST_PROGRESS}" == "0" || "${TEST_PROGRESS}" == "1" ]] || die "STRATEGY_TEST_PROGRESS должен быть 0 или 1"
+[[ "${TEST_STOP_AFTER_FOUND}" =~ ^[0-9]+$ ]] || die "STRATEGY_TEST_STOP_AFTER_FOUND должен быть целым числом от 0"
 command -v curl >/dev/null || die "не найден curl"
 command -v sudo >/dev/null || die "не найден sudo"
 
@@ -34,6 +38,8 @@ if (( $# > 0 )); then TEST_DOMAINS="$*"; fi
 mkdir -p "${SCRIPT_DIR}/logs/tests"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 log_file="${SCRIPT_DIR}/logs/tests/nfqws${NFQWS_ENGINE}-${timestamp}.log"
+result_dir="${SCRIPT_DIR}/logs/tests/results/nfqws${NFQWS_ENGINE}-${timestamp}"
+mkdir -p "${result_dir}"
 
 # nfqws drops root before loading Lua. A project under a mode-700 home directory
 # is therefore intentionally inaccessible. Stage the official tester in /tmp
@@ -92,8 +98,7 @@ if [[ "${NFQWS_ENGINE}" == "1" ]]; then
     export NFQWS="${tester_root}/nfq/nfqws"
     export MDIG="${tester_root}/mdig/mdig"
     export SKIP_TPWS=1
-    "${tester_root}/blockcheck.sh" 2>&1 | tee "${log_file}"
-    test_rc=${PIPESTATUS[0]}
+    tester_cmd=("${tester_root}/blockcheck.sh")
 else
     tester_root="${test_runtime}"
     [[ -x "${tester_root}/blockcheck2.sh" && -x "${tester_root}/nfq2/nfqws2" ]] || die "неполный комплект tester-а zapret2"
@@ -101,22 +106,52 @@ else
     export ZAPRET_RW="${SCRIPT_DIR}/logs/tests/zapret2-state"
     export NFQWS2="${tester_root}/nfq2/nfqws2"
     export MDIG="${tester_root}/mdig/mdig"
-    "${tester_root}/blockcheck2.sh" 2>&1 | tee "${log_file}"
-    test_rc=${PIPESTATUS[0]}
+    tester_cmd=("${tester_root}/blockcheck2.sh")
+fi
+
+strategy_total=0
+if [[ "${TEST_PROGRESS}" == "1" ]]; then
+    echo "Считаю стратегии перед запуском..."
+    plan_output="$(SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 BATCH=1 REPEATS=1 SIMULATE=1 SIM_SUCCESS_RATE=0 "${tester_cmd[@]}" 2>&1)"
+    strategy_total="$(printf '%s\n' "${plan_output}" | grep -cE '^- curl_test_.* : (nfqws2?|dvtws2?|winws2?) ' || true)"
+    [[ "${strategy_total}" =~ ^[0-9]+$ ]] || strategy_total=0
+    if (( strategy_total > 0 )); then
+        [[ "${TEST_LEVEL}" == "force" ]] && estimate_note="" || estimate_note=" (оценка; standard/quick может пропускать лишние ветки)"
+        echo "Стратегий к проверке: ${strategy_total}${estimate_note}"
+    else
+        echo "Не удалось заранее определить число стратегий; прогресс покажет обработанное количество."
+    fi
+fi
+(( TEST_STOP_AFTER_FOUND > 0 )) && echo "Автостоп: после ${TEST_STOP_AFTER_FOUND} полностью проверенных находок."
+echo
+
+"${tester_cmd[@]}" 2>&1 | tee "${log_file}" | "${SCRIPT_DIR}/scripts/live-strategy-capture.sh" \
+    "${NFQWS_ENGINE}" "${result_dir}" "${strategy_total}" "${TEST_STOP_AFTER_FOUND}"
+test_rc=${PIPESTATUS[0]}
+if [[ -f "${result_dir}/.stopped-after-found" ]]; then
+    test_rc=0
+    stopped_early=1
+else
+    stopped_early=0
 fi
 set -e
 
 echo
 if (( test_rc == 0 )); then
-    echo "Тест завершён. Итоговые стратегии ищите в секции SUMMARY:"
-    echo "  ${log_file}"
-    result_dir="${SCRIPT_DIR}/logs/tests/results/nfqws${NFQWS_ENGINE}-${timestamp}"
-    echo
-    if "${SCRIPT_DIR}/scripts/strategy-report.sh" "${log_file}" "${NFQWS_ENGINE}" "${result_dir}"; then
-        echo "Кандидаты разложены по доменам и протоколам."
+    if (( stopped_early == 1 )); then
+        echo "Тест корректно остановлен после заданного числа находок."
+        echo "Проверенные кандидаты уже сохранены в ${result_dir}/domains/"
+        echo "Полного SUMMARY и common/ при ранней остановке не будет."
     else
-        report_rc=$?
-        (( report_rc == 2 )) || echo "Не удалось разобрать SUMMARY (код ${report_rc})." >&2
+        echo "Тест завершён. Итоговые стратегии ищите в секции SUMMARY:"
+        echo "  ${log_file}"
+        echo
+        if "${SCRIPT_DIR}/scripts/strategy-report.sh" "${log_file}" "${NFQWS_ENGINE}" "${result_dir}"; then
+            echo "Кандидаты разложены по доменам и протоколам."
+        else
+            report_rc=$?
+            (( report_rc == 2 )) || echo "Не удалось разобрать SUMMARY (код ${report_rc})." >&2
+        fi
     fi
     echo "Переносить проверенные кандидаты нужно в $([[ "${NFQWS_ENGINE}" == "1" ]] && echo strategies/ || echo strategies2/)."
 else
