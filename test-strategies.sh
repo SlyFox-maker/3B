@@ -34,6 +34,20 @@ mkdir -p "${SCRIPT_DIR}/logs/tests"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 log_file="${SCRIPT_DIR}/logs/tests/nfqws${NFQWS_ENGINE}-${timestamp}.log"
 
+# nfqws drops root before loading Lua. A project under a mode-700 home directory
+# is therefore intentionally inaccessible. Stage the official tester in /tmp
+# instead of weakening permissions on the user's home directory.
+test_runtime="$(mktemp -d /tmp/3b-blockcheck.XXXXXX)"
+cleanup_runtime() { rm -rf -- "${test_runtime}"; }
+trap cleanup_runtime EXIT
+trap 'cleanup_runtime; exit 130' INT TERM
+if [[ "${NFQWS_ENGINE}" == "1" ]]; then
+    cp -a "${SCRIPT_DIR}/vendor/zapret1/." "${test_runtime}/"
+else
+    cp -a "${SCRIPT_DIR}/vendor/zapret2/." "${test_runtime}/"
+fi
+chmod -R a+rX "${test_runtime}"
+
 echo "Останавливаю действующую стратегию 3B, чтобы она не исказила результаты..."
 "${SCRIPT_DIR}/stop.sh"
 
@@ -52,7 +66,7 @@ echo
 
 set +e
 if [[ "${NFQWS_ENGINE}" == "1" ]]; then
-    tester_root="${SCRIPT_DIR}/vendor/zapret1"
+    tester_root="${test_runtime}"
     [[ -x "${tester_root}/blockcheck.sh" && -x "${tester_root}/nfq/nfqws" ]] || die "неполный комплект tester-а zapret1"
     export ZAPRET_BASE="${tester_root}"
     export ZAPRET_RW="${SCRIPT_DIR}/logs/tests/zapret1-state"
@@ -62,7 +76,7 @@ if [[ "${NFQWS_ENGINE}" == "1" ]]; then
     "${tester_root}/blockcheck.sh" 2>&1 | tee "${log_file}"
     test_rc=${PIPESTATUS[0]}
 else
-    tester_root="${SCRIPT_DIR}/vendor/zapret2"
+    tester_root="${test_runtime}"
     [[ -x "${tester_root}/blockcheck2.sh" && -x "${tester_root}/nfq2/nfqws2" ]] || die "неполный комплект tester-а zapret2"
     export ZAPRET_BASE="${tester_root}"
     export ZAPRET_RW="${SCRIPT_DIR}/logs/tests/zapret2-state"
