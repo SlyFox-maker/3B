@@ -3,10 +3,11 @@
 --new
 --filter-tcp=80,443,5222,5242
 --ipset=./ipsets/whatsapp-ips.txt
---dpi-desync=multisplit
+--dpi-desync=fake,multisplit
+--dpi-desync-repeats=2
 --dpi-desync-split-seqovl=2
 --dpi-desync-split-pos=1
---dpi-desync-fooling=md5sig
+--dpi-desync-fooling=md5sig,badseq
 --dpi-desync-any-protocol
 --dpi-desync-cutoff=d4
 --comment="WhatsApp TCP by IP"

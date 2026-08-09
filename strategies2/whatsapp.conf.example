@@ -1,0 +1,31 @@
+# WhatsApp TLS on known Meta networks
+--new=whatsapp-tcp-ip
+--filter-tcp=80,443,5222,5242
+--filter-l7=http,tls
+--ipset=./ipsets/whatsapp-ips.txt
+--payload=http_req,tls_client_hello
+--lua-desync=fake:blob=fake_default_tls:repeats=2:tcp_md5:tcp_seq=-66000
+--lua-desync=multisplit:pos=1:seqovl=2
+
+# WhatsApp CDN/cloud endpoints
+--new=whatsapp-tcp-domain
+--filter-tcp=80,443,5222,5242
+--filter-l7=http,tls
+--hostlist=./hostlists/whatsapp.txt
+--payload=http_req,tls_client_hello
+--lua-desync=multisplit:pos=1,midsld:seqovl=2
+
+# WhatsApp QUIC
+--new=whatsapp-quic
+--filter-udp=443
+--filter-l7=quic
+--ipset=./ipsets/whatsapp-ips.txt
+--payload=quic_initial
+--lua-desync=fake:blob=fake_default_quic:repeats=2
+
+# Calls/media (STUN and other UDP payloads)
+--new=whatsapp-media
+--filter-udp=3478,590-65535
+--ipset=./ipsets/whatsapp-ips.txt
+--payload=known,unknown
+--lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2:payload=all

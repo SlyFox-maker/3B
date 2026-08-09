@@ -1,0 +1,24 @@
+# YouTube HTTPS
+--new=youtube-tcp
+--filter-tcp=80,443
+--filter-l7=http,tls
+--hostlist=./hostlists/youtube.txt
+--payload=http_req,tls_client_hello
+--lua-desync=multisplit:pos=midsld-1
+
+# YouTube QUIC
+--new=youtube-quic
+--filter-udp=443
+--filter-l7=quic
+--hostlist=./hostlists/youtube.txt
+--payload=quic_initial
+--lua-desync=fake:blob=fake_default_quic:repeats=11
+
+# Video CDN TLS
+--new=youtube-video
+--filter-tcp=443
+--filter-l7=tls
+--hostlist-domains=googlevideo.com
+--payload=tls_client_hello
+--lua-desync=fake:blob=fake_default_tls:tls_mod=rnd,sni=<FAKE_SNI>:tcp_flags_unset=ack
+--lua-desync=multidisorder:pos=midsld

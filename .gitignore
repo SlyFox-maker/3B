@@ -5,11 +5,14 @@
 !/logs/.gitkeep
 *.pid
 *.tmp
+/.env
 strategies/*.conf
+strategies2/*.conf
 hostlists/*.txt
 ipsets/*.txt
 files/fake/*.bin
 !strategies/*.conf.example
+!strategies2/*.conf.example
 !hostlists/*.txt.example
 !ipsets/*.txt.example
 !files/fake/.gitkeep

@@ -1,393 +1,224 @@
-#!/bin/bash
-# ============================================================================
-# 3B DPI Unblock System
-# Advanced DPI bypass system with modular configuration
-# ============================================================================
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# --- Конфигурация (меняйте здесь) ---
-NFQWS_BIN="./nfqws"
-QUEUE_NUM=29
-LOG_MAX_BYTES=209715200
-PID_FILE="/run/3b-nfqws.pid"
-LOG_MAINTAINER_PID_FILE="/run/3b-log-maintainer.pid"
-LOG_ROUTER_PID_FILE="/run/3b-log-router.pid"
-STRATEGIES_DIR="./strategies"
-HOSTLISTS_DIR="./hostlists"
-NFQWS_TCP_PORTS="80,443,5222,5242"
-NFQWS_UDP_PORTS="443,3478,590:65535"
-NFQWS_FWMARK="0x40000000/0x40000000"
-IPTABLES_CHAIN="THREEB_NFQWS"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+
+ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/.env}"
+if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    set +a
+fi
+
+NFQWS_ENGINE="${NFQWS_ENGINE:-1}"
+QUEUE_NUM="${QUEUE_NUM:-29}"
 NFQWS_TRACE="${NFQWS_TRACE:-1}"
 NFQWS_FAKE_SNI="${NFQWS_FAKE_SNI:-dzen.ru}"
+NFQWS_TCP_PORTS="${NFQWS_TCP_PORTS:-80,443,5222,5242}"
+NFQWS_UDP_PORTS="${NFQWS_UDP_PORTS:-443,3478,590:65535}"
+NFQWS2_TCP_PKT_OUT="${NFQWS2_TCP_PKT_OUT:-20}"
+NFQWS2_TCP_PKT_IN="${NFQWS2_TCP_PKT_IN:-10}"
+NFQWS2_UDP_PKT_OUT="${NFQWS2_UDP_PKT_OUT:-6}"
+NFQWS2_UDP_PKT_IN="${NFQWS2_UDP_PKT_IN:-4}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"
 
-# --- Не менять ниже этой линии ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}" || exit 1
+NFQWS1_BIN="${NFQWS1_BIN:-${SCRIPT_DIR}/vendor/zapret1/nfq/nfqws}"
+NFQWS2_ROOT="${NFQWS2_ROOT:-${SCRIPT_DIR}/vendor/zapret2}"
+NFQWS2_BIN="${NFQWS2_BIN:-${NFQWS2_ROOT}/nfq2/nfqws2}"
+NFQWS_FWMARK="0x40000000/0x40000000"
+NFQWS_FWMARK_VALUE="0x40000000"
+OUT_CHAIN="THREEB_NFQWS_OUT"
+IN_CHAIN="THREEB_NFQWS_IN"
+
 LOG_DIR="${SCRIPT_DIR}/logs"
 PROFILE_LOG_DIR="${LOG_DIR}/profiles"
 LOG_FILE="${LOG_DIR}/nfqws.log"
 DEBUG_LOG="${LOG_DIR}/nfqws-debug.log"
-PROFILE_MAP="${LOG_DIR}/profile-map.tsv"
+PID_FILE="/run/3b-nfqws.pid"
+MAINTAINER_PID_FILE="/run/3b-log-maintainer.pid"
+ROUTER_PID_FILE="/run/3b-log-router.pid"
 mkdir -p "${PROFILE_LOG_DIR}"
 
-start_helper() {
-    local script_path="$1"
-    local pid_file="$2"
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+
+[[ "${NFQWS_ENGINE}" == "1" || "${NFQWS_ENGINE}" == "2" ]] || die "NFQWS_ENGINE должен быть 1 или 2"
+[[ "${QUEUE_NUM}" =~ ^[0-9]+$ ]] && (( QUEUE_NUM <= 65535 )) || die "некорректный QUEUE_NUM"
+[[ "${NFQWS_TRACE}" == "0" || "${NFQWS_TRACE}" == "1" ]] || die "NFQWS_TRACE должен быть 0 или 1"
+[[ "${NFQWS_FAKE_SNI}" =~ ^[A-Za-z0-9.-]+$ ]] || die "некорректный NFQWS_FAKE_SNI"
+command -v sudo >/dev/null || die "не найден sudo"
+command -v iptables >/dev/null || die "не найден iptables"
+
+if [[ "${NFQWS_ENGINE}" == "1" ]]; then
+    NFQWS_BIN="${NFQWS1_BIN}"
+    STRATEGIES_DIR="${NFQWS1_STRATEGIES_DIR:-${SCRIPT_DIR}/strategies}"
+else
+    NFQWS_BIN="${NFQWS2_BIN}"
+    STRATEGIES_DIR="${NFQWS2_STRATEGIES_DIR:-${SCRIPT_DIR}/strategies2}"
+    [[ -r "${NFQWS2_ROOT}/lua/zapret-lib.lua" && -r "${NFQWS2_ROOT}/lua/zapret-antidpi.lua" ]] || die "не найдены Lua-библиотеки nfqws2"
+fi
+[[ -x "${NFQWS_BIN}" ]] || die "не найден исполняемый файл ${NFQWS_BIN}"
+
+mapfile -t CONFIG_FILES < <(find "${STRATEGIES_DIR}" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | LC_ALL=C sort)
+(( ${#CONFIG_FILES[@]} > 0 )) || die "нет активных стратегий в ${STRATEGIES_DIR}; скопируйте нужный .conf.example в .conf"
+
+helper_stop() {
+    local pid_file="$1" pid=""
+    if sudo test -f "${pid_file}"; then
+        pid="$(sudo cat "${pid_file}" 2>/dev/null || true)"
+        [[ "${pid}" =~ ^[0-9]+$ ]] && sudo kill "${pid}" 2>/dev/null || true
+        sudo rm -f "${pid_file}"
+    fi
+}
+
+helper_start() {
+    local script="$1" pid_file="$2"
     shift 2
-
-    if sudo test -f "${pid_file}"; then
-        local old_pid
-        old_pid=$(sudo cat "${pid_file}" 2>/dev/null)
-        if [[ "${old_pid}" =~ ^[0-9]+$ ]]; then
-            sudo kill "${old_pid}" 2>/dev/null || true
-        fi
-        sudo rm -f "${pid_file}"
-    fi
-
-    sudo nohup "${script_path}" "${pid_file}" "$@" >/dev/null 2>&1 &
+    helper_stop "${pid_file}"
+    sudo nohup "${script}" "${pid_file}" "$@" >/dev/null 2>&1 &
 }
 
-stop_helper() {
-    local pid_file="$1"
-    if sudo test -f "${pid_file}"; then
-        local helper_pid
-        helper_pid=$(sudo cat "${pid_file}" 2>/dev/null)
-        if [[ "${helper_pid}" =~ ^[0-9]+$ ]]; then
-            sudo kill "${helper_pid}" 2>/dev/null || true
+stop_managed_nfqws() {
+    local pid="" comm=""
+    if sudo test -f "${PID_FILE}"; then pid="$(sudo cat "${PID_FILE}" 2>/dev/null || true)"; fi
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && sudo kill -0 "${pid}" 2>/dev/null; then
+        comm="$(ps -p "${pid}" -o comm= 2>/dev/null | xargs || true)"
+        if [[ "${comm}" == "nfqws" || "${comm}" == "nfqws2" ]]; then
+            sudo kill "${pid}" 2>/dev/null || true
+            for _ in {1..20}; do sudo kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
         fi
-        sudo rm -f "${pid_file}"
     fi
+    sudo rm -f "${PID_FILE}"
 }
 
-# ============================================================================
-# Сканирование стратегий
-# ============================================================================
-echo "Поиск стратегий в ${STRATEGIES_DIR}/"
-ACTIVE_STRATEGIES=""
-
-if [ -d "${STRATEGIES_DIR}" ]; then
-    for config_file in "${STRATEGIES_DIR}"/*.conf; do
-        if [ -f "${config_file}" ]; then
-            strategy_name=$(basename "${config_file}" .conf)
-            ACTIVE_STRATEGIES="${ACTIVE_STRATEGIES} ${strategy_name}"
-        fi
+remove_hook() {
+    local builtin="$1" chain="$2"
+    while sudo iptables -t mangle -C "${builtin}" -j "${chain}" 2>/dev/null; do
+        sudo iptables -t mangle -D "${builtin}" -j "${chain}" || break
     done
+}
 
-    ACTIVE_STRATEGIES=$(echo "${ACTIVE_STRATEGIES}" | xargs)
+remove_firewall() {
+    remove_hook OUTPUT "${OUT_CHAIN}"
+    remove_hook INPUT "${IN_CHAIN}"
+    sudo iptables -t mangle -F "${OUT_CHAIN}" 2>/dev/null || true
+    sudo iptables -t mangle -X "${OUT_CHAIN}" 2>/dev/null || true
+    sudo iptables -t mangle -F "${IN_CHAIN}" 2>/dev/null || true
+    sudo iptables -t mangle -X "${IN_CHAIN}" 2>/dev/null || true
+    remove_hook OUTPUT THREEB_NFQWS
+    sudo iptables -t mangle -F THREEB_NFQWS 2>/dev/null || true
+    sudo iptables -t mangle -X THREEB_NFQWS 2>/dev/null || true
+}
 
-    if [ -z "${ACTIVE_STRATEGIES}" ]; then
-        echo "Нет доступных стратегий. Создайте хотя бы один .conf файл."
-        exit 1
-    fi
-else
-    echo "Папка стратегий не существует: ${STRATEGIES_DIR}/"
-    exit 1
-fi
-
-stop_helper "${LOG_ROUTER_PID_FILE}"
-start_helper "${SCRIPT_DIR}/scripts/log-maintainer.sh" \
-    "${LOG_MAINTAINER_PID_FILE}" "${LOG_DIR}" "${LOG_MAX_BYTES}"
-
-clear
-echo "==============================================="
-echo "          3B DPI BYPASS SYSTEM v2.0"
-echo "==============================================="
-echo "Queue: ${QUEUE_NUM}"
-echo "Log: ${LOG_FILE}"
-echo "Trace: ${NFQWS_TRACE}"
-echo "Fake SNI: ${NFQWS_FAKE_SNI}"
-echo "Стратегии: ${ACTIVE_STRATEGIES}"
-echo "==============================================="
-echo ""
-
-# ============================================================================
-# 1. Остановка запущенных процессов
-# ============================================================================
-echo "[1/4] Остановка предыдущих процессов"
-echo "Проверка PID-файла ${PID_FILE}..."
-
-PREVIOUS_PID=""
-if sudo test -f "${PID_FILE}"; then
-    PREVIOUS_PID=$(sudo cat "${PID_FILE}" 2>/dev/null)
-fi
-
-if [[ "${PREVIOUS_PID}" =~ ^[0-9]+$ ]] && sudo kill -0 "${PREVIOUS_PID}" 2>/dev/null; then
-    PROCESS_NAME=$(ps -p "${PREVIOUS_PID}" -o comm= 2>/dev/null | xargs)
-    if [ "${PROCESS_NAME}" = "nfqws" ]; then
-        sudo kill "${PREVIOUS_PID}"
-        sleep 2
-        echo "Процесс ${PREVIOUS_PID} остановлен"
-    else
-        echo "PID ${PREVIOUS_PID} принадлежит ${PROCESS_NAME}, пропускаем"
-    fi
-else
-    echo "Управляемый процесс не найден"
-fi
-sudo rm -f "${PID_FILE}" 2>/dev/null
-
-echo "Очистка временных конфигов..."
-sudo rm -f /tmp/3b_nfqws_*.conf 2>/dev/null
-echo "Временные конфиги удалены"
-echo ""
-
-# ============================================================================
-# 2. Подготовка собственной цепочки iptables
-# ============================================================================
-echo "[2/4] Подготовка сетевых правил"
-
-LEGACY_RULES_REMOVED=0
-while IFS= read -r legacy_rule; do
-    if [[ "${legacy_rule}" == *"-j NFQUEUE"* ]] && \
-       [[ "${legacy_rule}" == *"--queue-num ${QUEUE_NUM}"* ]]; then
-        read -r -a legacy_args <<< "${legacy_rule}"
-        legacy_args[0]="-D"
-        if sudo iptables -t mangle "${legacy_args[@]}"; then
-            LEGACY_RULES_REMOVED=$((LEGACY_RULES_REMOVED + 1))
+remove_legacy_direct_rules() {
+    local rule
+    while IFS= read -r rule; do
+        if [[ "${rule}" == -A\ OUTPUT* && "${rule}" == *"-j NFQUEUE"* && "${rule}" == *"--queue-num ${QUEUE_NUM}"* ]]; then
+            read -r -a args <<< "${rule}"
+            args[0]="-D"
+            sudo iptables -t mangle "${args[@]}" || true
         fi
+    done < <(sudo iptables -t mangle -S OUTPUT)
+}
+
+FAIL_CLEANUP=1
+TEMP_CONFIG=""
+on_exit() {
+    local rc=$?
+    [[ -n "${TEMP_CONFIG}" && -f "${TEMP_CONFIG}" ]] && rm -f "${TEMP_CONFIG}"
+    if (( rc != 0 && FAIL_CLEANUP == 1 )); then
+        printf 'Запуск не завершён, удаляю добавленные правила.\n' >&2
+        remove_firewall || true
     fi
-done < <(sudo iptables -t mangle -S OUTPUT)
-echo "Удалено старых прямых правил NFQUEUE ${QUEUE_NUM}: ${LEGACY_RULES_REMOVED}"
+}
+trap on_exit EXIT
 
-if ! sudo iptables -t mangle -N "${IPTABLES_CHAIN}" 2>/dev/null; then
-    sudo iptables -t mangle -F "${IPTABLES_CHAIN}" || exit 1
-fi
+stop_managed_nfqws
+helper_stop "${ROUTER_PID_FILE}"
+remove_firewall
+remove_legacy_direct_rules
 
-if ! sudo iptables -t mangle -C OUTPUT -j "${IPTABLES_CHAIN}" 2>/dev/null; then
-    sudo iptables -t mangle -I OUTPUT 1 -j "${IPTABLES_CHAIN}" || exit 1
-fi
-
-echo "Цепочка готова: ${IPTABLES_CHAIN}"
-echo ""
-
-# ============================================================================
-# 3. Настройка правил трафика
-# ============================================================================
-echo "[3/4] Настройка перенаправления трафика"
-
-echo "Добавление исключений..."
-
-SSH_RULES=0
-if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p tcp --sport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
-if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p tcp --dport 22 -j RETURN 2>/dev/null; then SSH_RULES=$((SSH_RULES + 1)); fi
-echo "Правила SSH: ${SSH_RULES}"
-
-DNS_RULES=0
-for proto in tcp udp; do
-    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p "${proto}" --sport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
-    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -p "${proto}" --dport 53 -j RETURN 2>/dev/null; then DNS_RULES=$((DNS_RULES + 1)); fi
-done
-echo "Правила DNS: ${DNS_RULES}"
-
-LOCAL_NETS="127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
-LOCAL_COUNT=0
-for net in ${LOCAL_NETS}; do
-    if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" -d "${net}" -j RETURN 2>/dev/null; then LOCAL_COUNT=$((LOCAL_COUNT + 1)); fi
-done
-echo "Локальные сети: ${LOCAL_COUNT}"
-
-FWMARK_RULES=0
-if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
-    -m mark --mark "${NFQWS_FWMARK}" -j RETURN 2>/dev/null; then
-    FWMARK_RULES=$((FWMARK_RULES + 1))
-fi
-echo "Исключения fwmark: ${FWMARK_RULES}"
-if [ "${FWMARK_RULES}" -ne 1 ]; then
-    echo "Ошибка: не удалось добавить исключение fwmark ${NFQWS_FWMARK}."
-    exit 1
-fi
-
-MAIN_RULES=0
-if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
-    -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" \
-    -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
-    MAIN_RULES=$((MAIN_RULES + 1))
-fi
-
-if sudo iptables -t mangle -A "${IPTABLES_CHAIN}" \
-    -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" \
-    -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass; then
-    MAIN_RULES=$((MAIN_RULES + 1))
-fi
-echo "Основные правила: ${MAIN_RULES}"
-if [ "${MAIN_RULES}" -ne 2 ]; then
-    echo "Ошибка: не удалось добавить правила NFQUEUE."
-    echo "Проверьте поддержку модуля nfnetlink_queue."
-    exit 1
-fi
-
-echo ""
-echo "Текущее состояние цепочки ${IPTABLES_CHAIN}:"
-sudo iptables -t mangle -L "${IPTABLES_CHAIN}" -n --line-numbers
-echo ""
-
-# ============================================================================
-# 4. Создание конфига и запуск
-# ============================================================================
-echo "[4/4] Запуск системы"
-
-TEMP_CONFIG=$(mktemp /tmp/3b_nfqws_XXXXXX.conf)
-echo "Временный конфиг: ${TEMP_CONFIG}"
-
+TEMP_CONFIG="$(mktemp /tmp/3b_nfqws_XXXXXX.conf)"
 {
-    echo "--qnum=${QUEUE_NUM}"
-    echo "--pidfile=${PID_FILE}"
-    if [ "${NFQWS_TRACE}" = "1" ]; then
-        echo "--debug=1"
+    printf '%s\n' "--qnum=${QUEUE_NUM}" "--pidfile=${PID_FILE}"
+    if [[ "${NFQWS_ENGINE}" == "1" ]]; then
+        printf '%s\n' "--dpi-desync-fwmark=${NFQWS_FWMARK_VALUE}"
     else
-        echo "--daemon"
+        printf '%s\n' "--fwmark=${NFQWS_FWMARK_VALUE}"
+    fi
+    [[ "${NFQWS_TRACE}" == "1" ]] && printf '%s\n' '--debug=1' || printf '%s\n' '--daemon'
+    if [[ "${NFQWS_ENGINE}" == "2" ]]; then
+        printf '%s\n' "--lua-init=@${NFQWS2_ROOT}/lua/zapret-lib.lua" "--lua-init=@${NFQWS2_ROOT}/lua/zapret-antidpi.lua" "--lua-init=@${NFQWS2_ROOT}/lua/zapret-auto.lua"
     fi
 } > "${TEMP_CONFIG}"
 
-STRATEGY_COUNT=0
-for strategy in ${ACTIVE_STRATEGIES}; do
-    CONFIG_FILE="${STRATEGIES_DIR}/${strategy}.conf"
-
-    if [ -f "${CONFIG_FILE}" ]; then
-        STRATEGY_COUNT=$((STRATEGY_COUNT + 1))
-        echo "" >> "${TEMP_CONFIG}"
-        echo "# Strategy: ${strategy}" >> "${TEMP_CONFIG}"
-        if [ "${STRATEGY_COUNT}" -gt 1 ]; then
-            echo "--new" >> "${TEMP_CONFIG}"
-        fi
-        awk '
-            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-            {
-                if (first_option == "") {
-                    first_option=1
-                    if ($0 == "--new") next
-                }
-                print
-            }
-        ' "${CONFIG_FILE}" >> "${TEMP_CONFIG}"
-        echo "Стратегия загружена: ${strategy}"
-    fi
+strategy_count=0
+for config_file in "${CONFIG_FILES[@]}"; do
+    strategy_name="$(basename "${config_file}" .conf)"
+    ((strategy_count += 1))
+    printf '\n# Strategy: %s\n' "${strategy_name}" >> "${TEMP_CONFIG}"
+    (( strategy_count > 1 )) && printf '%s\n' '--new' >> "${TEMP_CONFIG}"
+    awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } !seen { seen=1; if ($0 ~ /^--new(=.*)?$/) next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
 done
 
-if [ "${STRATEGY_COUNT}" -eq 0 ]; then
-    echo "Ошибка: ни одной стратегии не найдено."
-    rm -f "${TEMP_CONFIG}"
-    exit 1
+sed -i -E -e "s/sni=<FAKE_SNI>/sni=${NFQWS_FAKE_SNI}/g" -e "s/rndsni/sni=${NFQWS_FAKE_SNI}/g" "${TEMP_CONFIG}"
+
+while IFS= read -r referenced; do
+    referenced="${referenced#@}"
+    [[ "${referenced}" = /* ]] || referenced="${SCRIPT_DIR}/${referenced#./}"
+    [[ -f "${referenced}" ]] || die "файл из конфигурации отсутствует: ${referenced}"
+done < <(sed -nE 's/.*--(hostlist|ipset)=([^[:space:]]+).*/\2/p' "${TEMP_CONFIG}" | tr -d '"')
+
+VALIDATION_CONFIG="$(mktemp /tmp/3b_nfqws_validate_XXXXXX.conf)"
+sed -E '/^--(debug|daemon|pidfile|dry-run)/d' "${TEMP_CONFIG}" > "${VALIDATION_CONFIG}"
+printf '%s\n' '--dry-run' >> "${VALIDATION_CONFIG}"
+"${NFQWS_BIN}" "@${VALIDATION_CONFIG}" >/dev/null 2>&1 || {
+    "${NFQWS_BIN}" "@${VALIDATION_CONFIG}" || true
+    rm -f "${VALIDATION_CONFIG}"
+    die "nfqws${NFQWS_ENGINE} отклонил собранную конфигурацию"
+}
+rm -f "${VALIDATION_CONFIG}"
+
+sudo iptables -t mangle -N "${OUT_CHAIN}"
+sudo iptables -t mangle -A "${OUT_CHAIN}" -m mark --mark "${NFQWS_FWMARK}" -j RETURN
+for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do sudo iptables -t mangle -A "${OUT_CHAIN}" -d "${net}" -j RETURN; done
+sudo iptables -t mangle -A "${OUT_CHAIN}" -p tcp --sport 22 -j RETURN
+sudo iptables -t mangle -A "${OUT_CHAIN}" -p tcp --dport 22 -j RETURN
+sudo iptables -t mangle -A "${OUT_CHAIN}" -p tcp --dport 53 -j RETURN
+sudo iptables -t mangle -A "${OUT_CHAIN}" -p udp --dport 53 -j RETURN
+
+if [[ "${NFQWS_ENGINE}" == "2" ]]; then
+    sudo iptables -t mangle -A "${OUT_CHAIN}" -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" -m connbytes --connbytes "1:${NFQWS2_TCP_PKT_OUT}" --connbytes-dir original --connbytes-mode packets -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
+    sudo iptables -t mangle -A "${OUT_CHAIN}" -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" -m connbytes --connbytes "1:${NFQWS2_UDP_PKT_OUT}" --connbytes-dir original --connbytes-mode packets -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
+    sudo iptables -t mangle -N "${IN_CHAIN}"
+    sudo iptables -t mangle -A "${IN_CHAIN}" -p tcp -m multiport --sports "${NFQWS_TCP_PORTS}" -m connbytes --connbytes "1:${NFQWS2_TCP_PKT_IN}" --connbytes-dir reply --connbytes-mode packets -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
+    sudo iptables -t mangle -A "${IN_CHAIN}" -p udp -m multiport --sports "${NFQWS_UDP_PORTS}" -m connbytes --connbytes "1:${NFQWS2_UDP_PKT_IN}" --connbytes-dir reply --connbytes-mode packets -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
+    sudo iptables -t mangle -I INPUT 1 -j "${IN_CHAIN}"
+else
+    sudo iptables -t mangle -A "${OUT_CHAIN}" -p tcp -m multiport --dports "${NFQWS_TCP_PORTS}" -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
+    sudo iptables -t mangle -A "${OUT_CHAIN}" -p udp -m multiport --dports "${NFQWS_UDP_PORTS}" -j NFQUEUE --queue-num "${QUEUE_NUM}" --queue-bypass
 fi
+sudo iptables -t mangle -I OUTPUT 1 -j "${OUT_CHAIN}"
 
-if [[ ! "${NFQWS_FAKE_SNI}" =~ ^[A-Za-z0-9.-]+$ ]]; then
-    echo "Ошибка: недопустимое значение NFQWS_FAKE_SNI=${NFQWS_FAKE_SNI}"
-    rm -f "${TEMP_CONFIG}"
-    exit 1
-fi
-
-sed -i -E \
-    -e "s/sni=<FAKE_SNI>/sni=${NFQWS_FAKE_SNI}/g" \
-    -e "s/rndsni/sni=${NFQWS_FAKE_SNI}/g" \
-    -e "s/sni=[A-Za-z0-9.-]+/sni=${NFQWS_FAKE_SNI}/g" \
-    "${TEMP_CONFIG}"
-
-echo ""
-echo "Предпросмотр:"
-cat "${TEMP_CONFIG}"
-echo ""
-
-echo "Карта профилей:"
-awk '
-    function begin_profile() {
-        if (!started) {
-            profile=1
-            started=1
-            printf "\nПрофиль %d [%s]", profile, source
-        }
-    }
-    /^# Strategy:/ { source=$0; sub(/^# Strategy:[[:space:]]*/, "", source) }
-    /^--new$/ {
-        if (started) profile++; else { profile=1; started=1 }
-        printf "\nПрофиль %d [%s]", profile, source
-    }
-    /^--comment=/ { begin_profile(); printf " | %s", $0 }
-    /^--filter-(tcp|udp|l7|l3)=/ || /^--(hostlist|hostlist-domains|ipset)=/ {
-        begin_profile()
-        printf "\n  %s", $0
-    }
-    END { print "" }
-' "${TEMP_CONFIG}"
-echo ""
-
-awk '
-    function register_profile() {
-        if (!started) { profile=1; started=1 }
-        if (!(profile in saved)) {
-            print profile "\t" source
-            saved[profile]=1
-        }
-    }
-    /^# Strategy:/ { source=$0; sub(/^# Strategy:[[:space:]]*/, "", source) }
-    /^--new$/ {
-        if (started) profile++; else { profile=1; started=1 }
-        register_profile()
-    }
-    /^--filter-(tcp|udp|l7|l3)=/ { register_profile() }
-' "${TEMP_CONFIG}" > "${PROFILE_MAP}"
-
-echo "Проверка hostlist файлов..."
-
-MISSING_FILES=0
-while read -r line; do
-    if [[ "${line}" =~ --hostlist= ]]; then
-        hostlist_file=$(echo "${line}" | cut -d'=' -f2- | tr -d '"')
-        if [[ ! -f "${hostlist_file}" ]]; then
-            echo "Файл отсутствует: ${hostlist_file}"
-            MISSING_FILES=$((MISSING_FILES + 1))
-        else
-            echo "Файл найден: ${hostlist_file}"
-        fi
-    fi
-done < "${TEMP_CONFIG}"
-
-if [ "${MISSING_FILES}" -gt 0 ]; then
-    echo "Ошибки: отсутствуют hostlist файлы."
-    rm -f "${TEMP_CONFIG}"
-    exit 1
-fi
-
-echo "Запуск nfqws..."
-sudo touch "${LOG_FILE}"
-sudo chmod 644 "${LOG_FILE}"
-
-if [ "${NFQWS_TRACE}" = "1" ]; then
-    sudo touch "${DEBUG_LOG}"
-    sudo chmod 644 "${DEBUG_LOG}"
+sudo touch "${LOG_FILE}" "${DEBUG_LOG}"
+sudo chmod 0644 "${LOG_FILE}" "${DEBUG_LOG}"
+helper_start "${SCRIPT_DIR}/scripts/log-maintainer.sh" "${MAINTAINER_PID_FILE}" "${LOG_DIR}" "${LOG_MAX_BYTES}"
+if [[ "${NFQWS_TRACE}" == "1" ]]; then
     sudo truncate -s 0 "${DEBUG_LOG}"
-    while IFS= read -r -d '' profile_log; do
-        sudo truncate -s 0 "${profile_log}"
-    done < <(find "${PROFILE_LOG_DIR}" -type f -name '*.log' -print0 2>/dev/null)
-    echo "Подробная трассировка: ${DEBUG_LOG}"
-fi
-
-if [ "${NFQWS_TRACE}" = "1" ]; then
     sudo nohup "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${DEBUG_LOG}" 2>&1 &
 else
     sudo "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${LOG_FILE}" 2>&1
 fi
-sleep 3
 
-# Проверка запуска
-ACTUAL_PID=""
-MAX_RETRIES=3
-RETRY_COUNT=0
-
-while [[ -z "${ACTUAL_PID}" && "${RETRY_COUNT}" -lt "${MAX_RETRIES}" ]]; do
-    sleep 1
-    if sudo test -f "${PID_FILE}"; then
-        ACTUAL_PID=$(sudo cat "${PID_FILE}" 2>/dev/null)
-    fi
-    RETRY_COUNT=$((RETRY_COUNT + 1))
+actual_pid=""
+for _ in {1..40}; do
+    if sudo test -f "${PID_FILE}"; then actual_pid="$(sudo cat "${PID_FILE}" 2>/dev/null || true)"; fi
+    [[ "${actual_pid}" =~ ^[0-9]+$ ]] && sudo kill -0 "${actual_pid}" 2>/dev/null && break
+    sleep 0.1
 done
+[[ "${actual_pid}" =~ ^[0-9]+$ ]] && sudo kill -0 "${actual_pid}" 2>/dev/null || die "nfqws${NFQWS_ENGINE} не запустился; проверьте ${DEBUG_LOG}"
 
-if [[ "${ACTUAL_PID}" =~ ^[0-9]+$ ]] && sudo kill -0 "${ACTUAL_PID}" 2>/dev/null; then
-    echo "nfqws запущен, PID: ${ACTUAL_PID}"
-    if [ "${NFQWS_TRACE}" = "1" ]; then
-        start_helper "${SCRIPT_DIR}/scripts/profile-log-router.sh" \
-            "${LOG_ROUTER_PID_FILE}" "${DEBUG_LOG}" "${PROFILE_MAP}" "${PROFILE_LOG_DIR}"
-        echo "Логи профилей: ${PROFILE_LOG_DIR}"
-    fi
-else
-    echo "Ошибка: nfqws не запустился. Проверьте ${LOG_FILE}"
-    exit 1
-fi
+FAIL_CLEANUP=0
+printf '3B запущен: engine=nfqws%s, PID=%s, queue=%s, strategies=%s\n' "${NFQWS_ENGINE}" "${actual_pid}" "${QUEUE_NUM}" "${#CONFIG_FILES[@]}"
+printf 'Лог: %s\n' "$([[ "${NFQWS_TRACE}" == "1" ]] && printf '%s' "${DEBUG_LOG}" || printf '%s' "${LOG_FILE}")"

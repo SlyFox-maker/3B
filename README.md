@@ -1,111 +1,138 @@
 # 3B DPI Bypass
 
-Небольшой обвес для запуска `nfqws` на VPN-сервере. Исходящий трафик выбранных портов попадает в Linux `NFQUEUE`, обрабатывается профилями `nfqws` и затем отправляется в интернет.
-
-Пример схемы с 3x-ui:
+Обвес для запуска `nfqws` первого или второго поколения на VPN-сервере. Движок выбирается в `.env`. Трафик выбранных портов попадает в Linux `NFQUEUE`, обрабатывается профилями и отправляется в интернет.
 
 ```text
 client -> inbound (3x-ui / VLESS)
        -> outbound (freedom)
        -> NFQUEUE
-       -> nfqws
+       -> nfqws1 или nfqws2
        -> internet
 ```
 
-> Скрипт изменяет системные правила `iptables` и должен запускаться с правами root. Перед применением на удалённом сервере сохраните текущие правила и обеспечьте резервный доступ к серверу.
+> Скрипт изменяет системные правила `iptables` и должен запускаться с правами root. Перед применением на удалённом сервере сохраните правила и обеспечьте резервный доступ.
 
 ## Требования
 
-- Linux с `iptables` и поддержкой `NFQUEUE`;
-- Bash, `sudo`, `ps` и `mktemp`;
-- совместимый исполняемый файл `nfqws` в корне проекта;
+- Linux с `iptables`, conntrack и поддержкой `NFQUEUE`;
+- Bash, `sudo`, `ps`, `find`, `awk`, `sed` и `mktemp`;
 - модуль ядра `nfnetlink_queue`.
 
-В репозитории находится 64-битный x86-совместимый бинарник `nfqws`. Для другой архитектуры замените его сборкой из проекта [bol-van/zapret](https://github.com/bol-van/zapret).
+В репозитории находятся x86-64 бинарники обоих поколений. Режим 1 и его tester используют официальный Zapret v72.13; режим 2 и Lua-библиотеки — Zapret2 v1.0.4. Для другой архитектуры замените бинарники сборками [zapret](https://github.com/bol-van/zapret) и [zapret2](https://github.com/bol-van/zapret2).
 
-## Быстрый старт
+## Выбор движка
 
-После клонирования активных стратегий нет. Файлы `*.example` служат только примерами и автоматически не запускаются.
+Создайте локальную конфигурацию:
 
-Включение примера YouTube:
+```bash
+cp .env.example .env
+```
+
+Основная переменная:
+
+```dotenv
+NFQWS_ENGINE=1
+```
+
+- `1` — классический `nfqws`, стратегии из `strategies/`;
+- `2` — Lua-движок `nfqws2`, стратегии из `strategies2/`.
+
+Файлы `*.example` автоматически не запускаются. Активными считаются только `*.conf`.
+
+## Быстрый старт nfqws1
 
 ```bash
 cp strategies/youtube.conf.example strategies/youtube.conf
 cp hostlists/youtube.txt.example hostlists/youtube.txt
-chmod +x start.sh nfqws
 sudo ./start.sh
 ```
 
-Скрипт загружает только файлы `strategies/*.conf`. Чтобы отключить профиль, переименуйте его, например в `youtube.conf.disabled`, и перезапустите скрипт.
-
-## WhatsApp
-
-Подготовьте конфигурацию и IP-список:
+Для WhatsApp:
 
 ```bash
 cp strategies/whatsapp.conf.example strategies/whatsapp.conf
 cp ipsets/whatsapp-ips.txt.example ipsets/whatsapp-ips.txt
 cp hostlists/whatsapp.txt.example hostlists/whatsapp.txt
 mkdir -p files/fake
-```
-
-Скачайте используемые примером бинарные шаблоны:
-
-```bash
 curl -L -o files/fake/quic_initial_www_google_com.bin \
   https://raw.githubusercontent.com/bol-van/zapret/master/files/fake/quic_initial_www_google_com.bin
-```
-
-Затем запустите:
-
-```bash
 sudo ./start.sh
 ```
 
-IP-диапазоны и стратегии обхода меняются со временем и зависят от провайдера. Примеры не гарантируют работу в любой сети.
+## Быстрый старт nfqws2
+
+Установите в `.env` `NFQWS_ENGINE=2`, затем:
+
+```bash
+cp strategies2/youtube.conf.example strategies2/youtube.conf
+cp hostlists/youtube.txt.example hostlists/youtube.txt
+sudo ./start.sh
+```
+
+Для WhatsApp:
+
+```bash
+cp strategies2/whatsapp.conf.example strategies2/whatsapp.conf
+cp ipsets/whatsapp-ips.txt.example ipsets/whatsapp-ips.txt
+cp hostlists/whatsapp.txt.example hostlists/whatsapp.txt
+sudo ./start.sh
+```
+
+`nfqws2` получает начало соединения в обоих направлениях. Лимиты задаются через `NFQWS2_TCP_PKT_OUT`, `NFQWS2_TCP_PKT_IN`, `NFQWS2_UDP_PKT_OUT` и `NFQWS2_UDP_PKT_IN`. Это позволяет Lua-стратегиям анализировать ответы и не отправлять всё соединение в userspace.
+
+## Управление
+
+Повторный запуск безопасно останавливает управляемый процесс и пересоздаёт собственные цепочки. Полная остановка:
+
+```bash
+sudo ./stop.sh
+```
+
+При ошибке запуска добавленные правила удаляются автоматически. Скрипты не удаляют посторонние правила `iptables`.
+
+Чтобы отключить стратегию, переименуйте её, например в `youtube.conf.disabled`, и перезапустите систему.
 
 ## Собственные стратегии
 
-Создайте файл `strategies/name.conf`. Каждый независимый профиль рекомендуется явно начинать с `--new`:
+Конфиги поколений несовместимы:
 
-```text
---new
---filter-tcp=443
---hostlist=./hostlists/example.txt
---dpi-desync=multisplit
---dpi-desync-split-pos=midsld
+- nfqws1 использует `--dpi-desync-*` и каталог `strategies/`;
+- nfqws2 использует `--payload`, `--lua-desync` и каталог `strategies2/`.
+
+Каждый независимый профиль начинайте с `--new`; в nfqws2 можно использовать именованный вариант `--new=name`. `--hostlist` принимает домены, `--ipset` — IP/CIDR. Порты перехвата задаются в `.env` через `NFQWS_TCP_PORTS` и `NFQWS_UDP_PORTS`.
+
+Подставной TLS SNI задаётся переменной `NFQWS_FAKE_SNI`. В примерах используется маркер `sni=<FAKE_SNI>`, который заменяется при сборке временного конфига.
+
+## Тестер и поиск стратегий
+
+Единый wrapper читает `NFQWS_ENGINE` и запускает совместимый официальный тестер: `blockcheck.sh` для nfqws1 или `blockcheck2.sh` для nfqws2. Текущая стратегия предварительно останавливается, полный вывод сохраняется в `logs/tests/`.
+
+```bash
+sudo ./test-strategies.sh youtube.com googlevideo.com
 ```
 
-- `--hostlist` принимает доменные имена;
-- `--ipset` принимает IP-адреса и CIDR-подсети;
-- fake-файлы храните в `files/fake`;
-- при добавлении новых портов обновите `NFQWS_TCP_PORTS` или `NFQWS_UDP_PORTS` в начале `start.sh`.
+Без аргументов тестер интерактивно спросит домены. Параметры поиска задаются в `.env`: `STRATEGY_TEST_LEVEL=quick|standard|force`, `STRATEGY_TEST_REPEATS`, `STRATEGY_TEST_IPV`, `STRATEGY_TEST_PARALLEL` и `STRATEGY_TEST_BATCH`.
+
+Результаты поколений несовместимы: вывод nfqws1 переносится в `strategies/`, вывод nfqws2 — в `strategies2/`. После теста основной сервис намеренно остаётся остановленным, чтобы не запустить автоматически ещё не проверенную стратегию.
 
 ## Диагностика
 
 ```bash
 pgrep -a nfqws
-sudo iptables -t mangle -L THREEB_NFQWS -n -v --line-numbers
-sudo tail -F /var/log/nfqws.log
+pgrep -a nfqws2
+sudo iptables -t mangle -L THREEB_NFQWS_OUT -n -v --line-numbers
+sudo iptables -t mangle -L THREEB_NFQWS_IN -n -v --line-numbers
+tail -F logs/nfqws-debug.log
 ```
 
-Подробную отладку `--debug=1` следует включать только временно: при большом объёме трафика лог быстро растёт и обработка может замедлиться.
+Trace включён по умолчанию. Отключение:
 
-Для временной подробной трассировки запустите:
-
-```bash
-sudo NFQWS_TRACE=1 ./start.sh
-sudo tail -n 0 -F logs/nfqws-debug.log
+```dotenv
+NFQWS_TRACE=0
 ```
 
-Полный журнал хранится в `logs/nfqws-debug.log`, а однозначно помеченные события профилей автоматически раскладываются по `logs/profiles/profile-N-name.log`. В trace-режиме `nfqws` работает под `nohup` с консольным `--debug=1`, чтобы пакетные события гарантированно попадали в файл. Если общий размер всех журналов достигает 200 МБ, они автоматически очищаются.
+Общий размер журналов ограничен значением `LOG_MAX_BYTES` (по умолчанию 200 МБ). Fake-пакеты получают mark `0x40000000` и исключаются из повторного попадания в очередь.
 
-Trace включён по умолчанию. Его можно отключить командой `sudo NFQWS_TRACE=0 ./start.sh`. Подставной TLS SNI централизованно задаётся переменной `NFQWS_FAKE_SNI` в начале `start.sh` и по умолчанию равен `dzen.ru`. В стратегиях используйте `sni=<FAKE_SNI>`; параметр `rndsni` при сборке также заменяется на настроенный SNI.
+## Лицензия и происхождение
 
-Скрипт исключает пакеты с fwmark `0x40000000`, чтобы созданные `nfqws` fake-пакеты не попадали в очередь повторно. В `NFQUEUE` направляется трафик только явно перечисленных TCP/UDP-портов.
-
-При запуске удаляются устаревшие прямые правила `NFQUEUE` с номером управляемой очереди из цепочки `OUTPUT`. Это убирает остатки старых версий скрипта, которые могли отправлять в `nfqws` весь трафик в обход собственной цепочки `THREEB_NFQWS`.
-
-## Благодарности
-
-Обработка DPI выполняется утилитой `nfqws` из проекта [Zapret](https://github.com/bol-van/zapret).
+Обработка DPI выполняется утилитами проектов [Zapret](https://github.com/bol-van/zapret) и [Zapret2](https://github.com/bol-van/zapret2). Лицензия vendored-компонентов Zapret2 находится в `vendor/zapret2/LICENSE.txt`.
