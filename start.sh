@@ -22,6 +22,8 @@ NFQWS2_TCP_PKT_OUT="${NFQWS2_TCP_PKT_OUT:-20}"
 NFQWS2_TCP_PKT_IN="${NFQWS2_TCP_PKT_IN:-10}"
 NFQWS2_UDP_PKT_OUT="${NFQWS2_UDP_PKT_OUT:-6}"
 NFQWS2_UDP_PKT_IN="${NFQWS2_UDP_PKT_IN:-4}"
+NFQWS2_UID="${NFQWS2_UID:-1}"
+NFQWS2_GID="${NFQWS2_GID:-3003}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"
 
 NFQWS1_BIN="${NFQWS1_BIN:-${SCRIPT_DIR}/vendor/zapret1/nfq/nfqws}"
@@ -48,6 +50,7 @@ die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 [[ "${QUEUE_NUM}" =~ ^[0-9]+$ ]] && (( QUEUE_NUM <= 65535 )) || die "некорректный QUEUE_NUM"
 [[ "${NFQWS_TRACE}" == "0" || "${NFQWS_TRACE}" == "1" ]] || die "NFQWS_TRACE должен быть 0 или 1"
 [[ "${NFQWS_FAKE_SNI}" =~ ^[A-Za-z0-9.-]+$ ]] || die "некорректный NFQWS_FAKE_SNI"
+[[ "${NFQWS2_UID}" =~ ^[0-9]+$ && "${NFQWS2_GID}" =~ ^[0-9]+$ ]] || die "NFQWS2_UID и NFQWS2_GID должны быть числами"
 command -v sudo >/dev/null || die "не найден sudo"
 command -v iptables >/dev/null || die "не найден iptables"
 
@@ -162,7 +165,7 @@ TEMP_CONFIG="$(mktemp /tmp/3b_nfqws_XXXXXX.conf)"
     if [[ "${NFQWS_ENGINE}" == "1" ]]; then
         printf '%s\n' "--dpi-desync-fwmark=${NFQWS_FWMARK_VALUE}"
     else
-        printf '%s\n' "--fwmark=${NFQWS_FWMARK_VALUE}"
+        printf '%s\n' "--fwmark=${NFQWS_FWMARK_VALUE}" "--uid=${NFQWS2_UID}:${NFQWS2_GID}"
     fi
     [[ "${NFQWS_TRACE}" == "1" ]] && printf '%s\n' '--debug=1' || printf '%s\n' '--daemon'
     if [[ "${NFQWS_ENGINE}" == "2" ]]; then
@@ -192,8 +195,13 @@ while IFS= read -r referenced; do
 done < <(sed -nE 's/.*--(hostlist|ipset)=([^[:space:]]+).*/\2/p' "${TEMP_CONFIG}" | tr -d '"')
 
 VALIDATION_CONFIG="$(mktemp /tmp/3b_nfqws_validate_XXXXXX.conf)"
-sed -E '/^--(debug|daemon|pidfile|dry-run)/d' "${TEMP_CONFIG}" > "${VALIDATION_CONFIG}"
-printf '%s\n' '--dry-run' >> "${VALIDATION_CONFIG}"
+{
+    # Keep validation-only global flags before the first profile. Some nfqws2
+    # builds treat global options placed after --new as profile-local and may
+    # otherwise attempt to open NFQUEUE during what should be a dry run.
+    printf '%s\n' '--dry-run' '--intercept=0'
+    sed -E '/^--(debug|daemon|pidfile|dry-run|intercept)/d' "${TEMP_CONFIG}"
+} > "${VALIDATION_CONFIG}"
 "${NFQWS_BIN}" "@${VALIDATION_CONFIG}" >/dev/null 2>&1 || {
     "${NFQWS_BIN}" "@${VALIDATION_CONFIG}" || true
     rm -f "${VALIDATION_CONFIG}"

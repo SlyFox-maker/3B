@@ -211,6 +211,9 @@ if [[ -f "${result_dir}/.stopped-after-found" ]]; then
 else
     stopped_early=0
 fi
+found_count="$(wc -l < "${result_dir}/index.live.tsv" 2>/dev/null || printf '0')"
+found_count="${found_count//[[:space:]]/}"
+[[ "${found_count}" =~ ^[0-9]+$ ]] || found_count=0
 set -e
 
 echo
@@ -222,6 +225,11 @@ if (( test_rc == 0 )); then
     else
         echo "Тест завершён. Итоговые стратегии ищите в секции SUMMARY:"
         echo "  ${log_file}"
+        if (( TEST_STOP_AFTER_FOUND > 0 && found_count < TEST_STOP_AFTER_FOUND )); then
+            echo "Цель не набрана: найдено ${found_count} из ${TEST_STOP_AFTER_FOUND}; сохраняю всё найденное."
+        else
+            echo "Найдено успешных стратегий: ${found_count}."
+        fi
         echo
         if "${SCRIPT_DIR}/scripts/strategy-report.sh" "${log_file}" "${NFQWS_ENGINE}" "${result_dir}"; then
             echo "Кандидаты разложены по доменам и протоколам."
