@@ -26,9 +26,19 @@ filter_for_protocol() {
     esac
 }
 
-processed=0 found=0 started_at="$(date +%s)"
-show_progress() {
-    ((processed += 1))
+processed=0 found=0 started_at="$(date +%s)" progress_text=""
+tty_progress=0
+[[ -t 1 ]] && tty_progress=1
+
+clear_progress() {
+    (( tty_progress == 1 )) && [[ -n "${progress_text}" ]] && printf '\r\033[2K'
+    return 0
+}
+render_progress() {
+    (( tty_progress == 1 )) && printf '\r\033[2K%s' "${progress_text}"
+    return 0
+}
+build_progress() {
     local width=30 filled=0 percent=0 elapsed now bar rest
     if (( TOTAL > 0 )); then
         percent=$((processed * 100 / TOTAL))
@@ -41,17 +51,29 @@ show_progress() {
     now="$(date +%s)"
     elapsed=$((now - started_at))
     if (( TOTAL > 0 )); then
-        printf '\n>>> PROGRESS: [%s] %d/%d (%d%%) | найдено: %d | %02d:%02d\n\n' \
+        printf -v progress_text '>>> PROGRESS: [%s] %d/%d (%d%%) | найдено: %d | %02d:%02d' \
             "${bar}" "${processed}" "${TOTAL}" "${percent}" "${found}" "$((elapsed / 60))" "$((elapsed % 60))"
     else
-        printf '\n>>> PROGRESS: обработано %d | найдено: %d | %02d:%02d\n\n' \
+        printf -v progress_text '>>> PROGRESS: обработано %d | найдено: %d | %02d:%02d' \
             "${processed}" "${found}" "$((elapsed / 60))" "$((elapsed % 60))"
+    fi
+}
+show_progress() {
+    ((processed += 1))
+    build_progress
+    if (( tty_progress == 1 )); then
+        render_progress
+    else
+        printf '\n%s\n\n' "${progress_text}"
     fi
 }
 
 current_test="" current_ipver="" current_domain="" current_strategy=""
+build_progress
+render_progress
 while IFS= read -r line; do
     # Preserve the original tester output on screen.
+    clear_progress
     printf '%s\n' "${line}"
     clean="${line%$'\r'}"
     if [[ "${clean}" =~ ^-[[:space:]]+(curl_test_[^[:space:]]+)[[:space:]]+(ipv[46])[[:space:]]+([^[:space:]]+)[[:space:]]+:[[:space:]]+(nfqws2?|dvtws2?|winws2?)[[:space:]]+(.*)$ ]]; then
@@ -59,6 +81,7 @@ while IFS= read -r line; do
         current_ipver="${BASH_REMATCH[2]}"
         current_domain="${BASH_REMATCH[3]}"
         current_strategy="${BASH_REMATCH[5]}"
+        render_progress
         continue
     fi
     if [[ "${clean}" == UNAVAILABLE\ code=* ]] && [[ -n "${current_strategy}" ]]; then
@@ -66,8 +89,14 @@ while IFS= read -r line; do
         current_test="" current_ipver="" current_domain="" current_strategy=""
         continue
     fi
-    [[ "${clean}" == *"!!!!! AVAILABLE !!!!!"* ]] || continue
-    [[ -n "${current_test}" && -n "${current_domain}" && -n "${current_strategy}" ]] || continue
+    if [[ "${clean}" != *"!!!!! AVAILABLE !!!!!"* ]]; then
+        render_progress
+        continue
+    fi
+    if [[ -z "${current_test}" || -z "${current_domain}" || -z "${current_strategy}" ]]; then
+        render_progress
+        continue
+    fi
 
     protocol="$(protocol_name "${current_test}")"
     domain="${current_domain%%/*}"
@@ -99,7 +128,12 @@ while IFS= read -r line; do
     current_test="" current_ipver="" current_domain="" current_strategy=""
     if (( STOP_AFTER_FOUND > 0 && found >= STOP_AFTER_FOUND )); then
         touch "${RESULT_DIR}/.stopped-after-found"
+        clear_progress
         printf '>>> AUTO-STOP: найдено %d/%d. Каждая находка прошла все настроенные повторы.\n' "${found}" "${STOP_AFTER_FOUND}"
         exit 0
     fi
 done
+if (( tty_progress == 1 )); then
+    clear_progress
+    printf '%s\n' "${progress_text}"
+fi

@@ -13,22 +13,97 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 NFQWS_ENGINE="${NFQWS_ENGINE:-1}"
-TEST_LEVEL="${STRATEGY_TEST_LEVEL:-standard}"
-TEST_REPEATS="${STRATEGY_TEST_REPEATS:-3}"
+TEST_LEVEL="${STRATEGY_TEST_LEVEL-}"
+TEST_REPEATS="${STRATEGY_TEST_REPEATS-}"
 TEST_BATCH="${STRATEGY_TEST_BATCH:-0}"
 TEST_PARALLEL="${STRATEGY_TEST_PARALLEL:-0}"
 TEST_IPV="${STRATEGY_TEST_IPV:-4}"
 TEST_DOMAINS="${STRATEGY_TEST_DOMAINS:-}"
 TEST_CURL_MAX_TIME="${STRATEGY_TEST_CURL_MAX_TIME:-3}"
-TEST_IP_OVERRIDES="${STRATEGY_TEST_IP_OVERRIDES:-}"
+TEST_IP_OVERRIDES="${STRATEGY_TEST_IP_OVERRIDES-}"
 TEST_PROGRESS="${STRATEGY_TEST_PROGRESS:-1}"
-TEST_STOP_AFTER_FOUND="${STRATEGY_TEST_STOP_AFTER_FOUND:-0}"
+TEST_TOTAL="${STRATEGY_TEST_TOTAL-}"
+TEST_STOP_AFTER_FOUND="${STRATEGY_TEST_STOP_AFTER_FOUND-}"
 
 die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+
+read_answer() {
+    local __name="$1" prompt="$2" answer
+    if ! IFS= read -r -p "${prompt}" answer; then
+        die "невозможно прочитать интерактивный параметр ${__name}; заполните его в .env"
+    fi
+    printf -v "${__name}" '%s' "${answer}"
+}
+
+if [[ -z "${TEST_LEVEL}" ]]; then
+    echo "Режим поиска STRATEGY_TEST_LEVEL определяет глубину перебора:"
+    echo "  1) quick    — быстрый поиск, останавливает ветки после раннего успеха"
+    echo "  2) standard — разумный баланс времени и числа вариантов (рекомендуется)"
+    echo "  3) force    — максимально полный и самый долгий перебор"
+    while :; do
+        read_answer TEST_LEVEL "Выберите режим [2/standard]: "
+        case "${TEST_LEVEL}" in
+            ''|2|standard) TEST_LEVEL=standard; break ;;
+            1|quick) TEST_LEVEL=quick; break ;;
+            3|force) TEST_LEVEL=force; break ;;
+            *) echo "Введите 1, 2, 3 либо quick, standard, force." ;;
+        esac
+    done
+    echo
+fi
+
+if [[ -z "${TEST_REPEATS}" ]]; then
+    echo "STRATEGY_TEST_REPEATS — сколько раз подряд стратегия должна успешно пройти проверку."
+    echo "Больше повторов повышает надёжность, но пропорционально увеличивает время."
+    while :; do
+        read_answer TEST_REPEATS "Количество повторов [3]: "
+        TEST_REPEATS="${TEST_REPEATS:-3}"
+        [[ "${TEST_REPEATS}" =~ ^[1-9][0-9]*$ ]] && break
+        echo "Введите целое число больше нуля."
+    done
+    echo
+fi
+
+if [[ -z "${TEST_TOTAL}" ]]; then
+    echo "STRATEGY_TEST_TOTAL — сохранённая оценка общего числа стратегий для progress bar."
+    echo "0 запускает предварительный подсчёт; готовое число (например 1000) позволяет начать сразу."
+    echo "Если реальных стратегий больше оценки, тест всё равно продолжится после 100%."
+    while :; do
+        read_answer TEST_TOTAL "Оценка общего количества [0/подсчитать]: "
+        TEST_TOTAL="${TEST_TOTAL:-0}"
+        [[ "${TEST_TOTAL}" =~ ^[0-9]+$ ]] && break
+        echo "Введите целое число от нуля."
+    done
+    echo
+fi
+
+if [[ -z "${TEST_STOP_AFTER_FOUND}" ]]; then
+    echo "STRATEGY_TEST_STOP_AFTER_FOUND — сколько полностью проверенных стратегий нужно найти."
+    echo "После достижения числа tester корректно остановится; 0 означает пройти весь перебор."
+    while :; do
+        read_answer TEST_STOP_AFTER_FOUND "Остановиться после количества находок [0/не останавливать]: "
+        TEST_STOP_AFTER_FOUND="${TEST_STOP_AFTER_FOUND:-0}"
+        [[ "${TEST_STOP_AFTER_FOUND}" =~ ^[0-9]+$ ]] && break
+        echo "Введите целое число от нуля."
+    done
+    echo
+fi
+
+if [[ -z "${TEST_IP_OVERRIDES}" ]]; then
+    echo "STRATEGY_TEST_IP_OVERRIDES — принудительные IPv4-адреса для отдельных доменов."
+    echo "Это сохраняет исходные hostname/SNI, но направляет соединение на указанный frontend."
+    echo "Формат: domain=IPv4; несколько пар разделяются пробелами."
+    echo "Пример: whatsapp.com=57.144.251.32 web.whatsapp.com=57.144.251.32"
+    echo "Нажмите Enter, чтобы не подменять адреса и использовать обычный DNS."
+    read_answer TEST_IP_OVERRIDES "IP overrides [без подмены]: "
+    echo
+fi
+
 [[ "${NFQWS_ENGINE}" == "1" || "${NFQWS_ENGINE}" == "2" ]] || die "NFQWS_ENGINE должен быть 1 или 2"
 [[ "${TEST_REPEATS}" =~ ^[1-9][0-9]*$ ]] || die "STRATEGY_TEST_REPEATS должен быть положительным числом"
 [[ "${TEST_LEVEL}" == "quick" || "${TEST_LEVEL}" == "standard" || "${TEST_LEVEL}" == "force" ]] || die "STRATEGY_TEST_LEVEL должен быть quick, standard или force"
 [[ "${TEST_PROGRESS}" == "0" || "${TEST_PROGRESS}" == "1" ]] || die "STRATEGY_TEST_PROGRESS должен быть 0 или 1"
+[[ "${TEST_TOTAL}" =~ ^[0-9]+$ ]] || die "STRATEGY_TEST_TOTAL должен быть целым числом от 0"
 [[ "${TEST_STOP_AFTER_FOUND}" =~ ^[0-9]+$ ]] || die "STRATEGY_TEST_STOP_AFTER_FOUND должен быть целым числом от 0"
 command -v curl >/dev/null || die "не найден curl"
 command -v sudo >/dev/null || die "не найден sudo"
@@ -109,8 +184,10 @@ else
     tester_cmd=("${tester_root}/blockcheck2.sh")
 fi
 
-strategy_total=0
-if [[ "${TEST_PROGRESS}" == "1" ]]; then
+strategy_total="${TEST_TOTAL}"
+if (( strategy_total > 0 )); then
+    echo "Стратегий по сохранённой оценке: ${strategy_total}"
+elif [[ "${TEST_PROGRESS}" == "1" ]]; then
     echo "Считаю стратегии перед запуском..."
     plan_output="$(SKIP_DNSCHECK=1 SKIP_IPBLOCK=1 BATCH=1 REPEATS=1 SIMULATE=1 SIM_SUCCESS_RATE=0 "${tester_cmd[@]}" 2>&1)"
     strategy_total="$(printf '%s\n' "${plan_output}" | grep -cE '^- curl_test_.* : (nfqws2?|dvtws2?|winws2?) ' || true)"
