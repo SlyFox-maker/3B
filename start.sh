@@ -253,9 +253,9 @@ sudo chmod 0644 "${LOG_FILE}" "${DEBUG_LOG}"
 helper_start "${SCRIPT_DIR}/scripts/log-maintainer.sh" "${MAINTAINER_PID_FILE}" "${LOG_DIR}" "${LOG_MAX_BYTES}"
 if [[ "${NFQWS_TRACE}" == "1" ]]; then
     sudo truncate -s 0 "${DEBUG_LOG}"
-    sudo nohup "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${DEBUG_LOG}" 2>&1 &
+    sudo nohup "${NFQWS_BIN}" "@${EFFECTIVE_CONFIG}" >> "${DEBUG_LOG}" 2>&1 &
 else
-    sudo "${NFQWS_BIN}" "@${TEMP_CONFIG}" >> "${LOG_FILE}" 2>&1
+    sudo "${NFQWS_BIN}" "@${EFFECTIVE_CONFIG}" >> "${LOG_FILE}" 2>&1
 fi
 
 actual_pid=""
