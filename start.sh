@@ -22,8 +22,8 @@ NFQWS2_TCP_PKT_OUT="${NFQWS2_TCP_PKT_OUT:-20}"
 NFQWS2_TCP_PKT_IN="${NFQWS2_TCP_PKT_IN:-10}"
 NFQWS2_UDP_PKT_OUT="${NFQWS2_UDP_PKT_OUT:-6}"
 NFQWS2_UDP_PKT_IN="${NFQWS2_UDP_PKT_IN:-4}"
-NFQWS2_UID="${NFQWS2_UID:-1}"
-NFQWS2_GID="${NFQWS2_GID:-3003}"
+NFQWS2_UID="${NFQWS2_UID:-0}"
+NFQWS2_GID="${NFQWS2_GID:-0}"
 LOG_MAX_BYTES="${LOG_MAX_BYTES:-209715200}"
 
 NFQWS1_BIN="${NFQWS1_BIN:-${SCRIPT_DIR}/vendor/zapret1/nfq/nfqws}"
@@ -61,6 +61,11 @@ else
     NFQWS_BIN="${NFQWS2_BIN}"
     STRATEGIES_DIR="${NFQWS2_STRATEGIES_DIR:-${SCRIPT_DIR}/strategies2}"
     [[ -r "${NFQWS2_ROOT}/lua/zapret-lib.lua" && -r "${NFQWS2_ROOT}/lua/zapret-antidpi.lua" ]] || die "не найдены Lua-библиотеки nfqws2"
+    if (( NFQWS2_UID != 0 )); then
+        command -v getcap >/dev/null || die "NFQWS2_UID=${NFQWS2_UID}, но getcap не установлен; используйте NFQWS2_UID=0 и NFQWS2_GID=0"
+        nfqws2_caps="$(getcap "${NFQWS_BIN}" 2>/dev/null || true)"
+        [[ "${nfqws2_caps}" == *cap_net_admin* ]] || die "nfqws2 сбросит права до UID=${NFQWS2_UID} без CAP_NET_ADMIN; задайте NFQWS2_UID=0 и NFQWS2_GID=0"
+    fi
 fi
 [[ -x "${NFQWS_BIN}" ]] || die "не найден исполняемый файл ${NFQWS_BIN}"
 
