@@ -187,11 +187,18 @@ for config_file in "${CONFIG_FILES[@]}"; do
     strategy_name="$(basename "${config_file}" .conf)"
     ((strategy_count += 1))
     printf '\n# Strategy: %s\n' "${strategy_name}" >> "${TEMP_CONFIG}"
-    (( strategy_count > 1 )) && printf '%s\n' '--new' >> "${TEMP_CONFIG}"
-    awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } !seen { seen=1; if ($0 ~ /^--new(=.*)?$/) next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
+    first_option="$(awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print; exit }' "${config_file}")"
+    [[ "${first_option}" =~ ^--new(=.*)?$ ]] || printf '%s\n' "--new=${strategy_name}" >> "${TEMP_CONFIG}"
+    awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
 done
 
 sed -i -E -e "s/sni=<FAKE_SNI>/sni=${NFQWS_FAKE_SNI}/g" -e "s/rndsni/sni=${NFQWS_FAKE_SNI}/g" "${TEMP_CONFIG}"
+
+# Keep the exact assembled config (without secrets) so a running profile can
+# be diagnosed after the temporary @config file is removed.
+EFFECTIVE_CONFIG="${LOG_DIR}/nfqws-effective.conf"
+cp "${TEMP_CONFIG}" "${EFFECTIVE_CONFIG}"
+chmod 0644 "${EFFECTIVE_CONFIG}"
 
 while IFS= read -r referenced; do
     referenced="${referenced#@}"
