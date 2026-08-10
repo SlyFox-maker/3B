@@ -206,6 +206,11 @@ EFFECTIVE_CONFIG="${LOG_DIR}/nfqws-effective.conf"
 cp "${TEMP_CONFIG}" "${EFFECTIVE_CONFIG}"
 chmod 0644 "${EFFECTIVE_CONFIG}"
 
+# Passing the assembled options as an argv array is the same execution model
+# used by blockcheck2. It also avoids platform-dependent partial parsing of a
+# live @config file after nfqws2 has initialized and written its pidfile.
+mapfile -t NFQWS_ARGS < <(awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print }' "${EFFECTIVE_CONFIG}")
+
 while IFS= read -r referenced; do
     referenced="${referenced#@}"
     [[ "${referenced}" = /* ]] || referenced="${SCRIPT_DIR}/${referenced#./}"
@@ -253,9 +258,9 @@ sudo chmod 0644 "${LOG_FILE}" "${DEBUG_LOG}"
 helper_start "${SCRIPT_DIR}/scripts/log-maintainer.sh" "${MAINTAINER_PID_FILE}" "${LOG_DIR}" "${LOG_MAX_BYTES}"
 if [[ "${NFQWS_TRACE}" == "1" ]]; then
     sudo truncate -s 0 "${DEBUG_LOG}"
-    sudo nohup "${NFQWS_BIN}" "@${EFFECTIVE_CONFIG}" >> "${DEBUG_LOG}" 2>&1 &
+    sudo nohup "${NFQWS_BIN}" "${NFQWS_ARGS[@]}" >> "${DEBUG_LOG}" 2>&1 &
 else
-    sudo "${NFQWS_BIN}" "@${EFFECTIVE_CONFIG}" >> "${LOG_FILE}" 2>&1
+    sudo "${NFQWS_BIN}" "${NFQWS_ARGS[@]}" >> "${LOG_FILE}" 2>&1
 fi
 
 actual_pid=""
