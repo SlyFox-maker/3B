@@ -188,8 +188,14 @@ for config_file in "${CONFIG_FILES[@]}"; do
     ((strategy_count += 1))
     printf '\n# Strategy: %s\n' "${strategy_name}" >> "${TEMP_CONFIG}"
     first_option="$(awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print; exit }' "${config_file}")"
-    [[ "${first_option}" =~ ^--new(=.*)?$ ]] || printf '%s\n' "--new=${strategy_name}" >> "${TEMP_CONFIG}"
-    awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
+    if (( strategy_count == 1 )); then
+        # nfqws2 already has the first user profile before the first --new.
+        # Keeping that first delimiter would create an empty catch-all profile.
+        awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } !seen { seen=1; if ($0 ~ /^--new=/) { sub(/^--new=/,"--name="); print; next } if ($0 == "--new") next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
+    else
+        [[ "${first_option}" =~ ^--new(=.*)?$ ]] || printf '%s\n' "--new=${strategy_name}" >> "${TEMP_CONFIG}"
+        awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next } { print }' "${config_file}" >> "${TEMP_CONFIG}"
+    fi
 done
 
 sed -i -E -e "s/sni=<FAKE_SNI>/sni=${NFQWS_FAKE_SNI}/g" -e "s/rndsni/sni=${NFQWS_FAKE_SNI}/g" "${TEMP_CONFIG}"
