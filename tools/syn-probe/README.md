@@ -1,0 +1,166 @@
+# 3B SYN Probe
+
+Кратковременная диагностика TCP SYN к **одному** IPv4-адресу и порту. Запускайте на Ubuntu Server **в сети, отправляющей SYN**, а не только на VPS назначения. Для рассматриваемого случая это клиентский Linux-хост в российской сети. Инструмент использует `vendor/zapret2/nfq2/nfqws2` и `vendor/zapret2/lua/`, не запускает `start.sh`/`stop.sh` и не меняет профили 3B.
+
+## Требования и перенос
+
+Linux x86-64, Python 3.11+, Bash, `sudo`, `iptables`, `iptables-save`, `iproute2` (`ip`, `ss`), поддержка `NFQUEUE`, `CAP_NET_ADMIN` и `CAP_NET_RAW`. Для backend `iptables-nft` нужен `nft`, чтобы проверить конфликты очередей. При `ENABLE_PACKET_CAPTURE=true` нужен `tcpdump`. Используется поставляемый статический nfqws2 v1.0.4 с проверкой SHA-256 по `vendor/zapret2/VERSION`. Docker и systemd не нужны. На Ubuntu Server зависимости устанавливает оператор:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 iptables nftables iproute2 tcpdump
+```
+
+Инструмент сам ничего не устанавливает.
+
+Перенесите **весь репозиторий** (включая `vendor/zapret2`) через Git или архив. Копия только `tools/syn-probe` не содержит бинарника и Lua. Из любого каталога:
+
+```bash
+cd /путь/к/3B
+cp tools/syn-probe/config.example.env tools/syn-probe/config.env
+sudo ./tools/syn-probe/syn-probe.sh doctor
+```
+
+Если модуль ещё не опубликован в Git, перенесите текущие файлы с рабочей станции без локальных конфигураций и отчётов, например:
+
+```bash
+rsync -a --exclude='.git/' --exclude='.env' --exclude='config.env' \
+  --exclude='logs/' --exclude='reports/' --exclude='__pycache__/' \
+  /путь/к/3B/ user@client:/opt/3B/
+```
+
+После публикации этих файлов в Git можно вместо этого клонировать весь репозиторий. Текущая рабочая копия сама по себе через `git pull` на другой машине не появится.
+
+`config.env` — отдельный файл модуля. Не добавляйте в него секреты. Перед тестом убедитесь, что у вас есть резервная консоль или другая независимая возможность управления клиентской машиной. `doctor` показывает состояние SSH-сессии, но не может подтвердить работу резервного доступа.
+
+## Параметры
+
+| Параметр | Пример | Значение |
+|---|---:|---|
+| `TARGET_IP` | `72.56.124.34` | Один публичный IPv4, без CIDR. |
+| `TARGET_PORT` | `25531` | TCP-порт назначения. |
+| `NFQUEUE_NUM` | `129` | Собственная очередь; при конфликте запуск запрещён. |
+| `TEST_DURATION_SECONDS` | `60` | Срок принудительного отката, 15–3600 секунд. |
+| `TEST_ATTEMPTS` | `5` | Число TCP connect попыток, 1–100. |
+| `CONNECT_TIMEOUT_SECONDS` | `5` | Таймаут каждой попытки, 1–30 секунд. |
+| `ENABLE_PACKET_CAPTURE` | `true` | Запись клиентского pcap через tcpdump. |
+| `ENABLE_SYNDATA` | `true` | Требуется для `test`; baseline его не использует. |
+| `REPORT_FORMATS` | `json,markdown` | Форматы итогового отчёта. |
+| `ADAPTIVE_DURATION_SECONDS` | `1200` | Предел каждой фазы adaptive; для syndata это срок watchdog. |
+| `BURST_CONNECTIONS` | `5` | 1–10 последовательных соединений в короткой серии. |
+| `BURST_RATE_PER_SECOND` | `1` | 0.1–2 подключения в секунду, без параллельных соединений. |
+| `RECOVERY_INTERVAL_SECONDS` | `15` | Пауза 10–60 секунд между проверками восстановления. |
+| `RECOVERY_SAMPLES` | `8` | 1–12 проверок восстановления. |
+| `TLS_TEST_PORT`, `TLS_SERVER_NAME` | `0`, пусто | По умолчанию TLS отключён. Укажите порт совместимого TLS-сервиса и DNS-имя сертификата. |
+| `PORT_COMPARISON_PORTS` | пусто | До четырёх явно разрешённых TCP-портов своего VPS. |
+| `PORTS_VERIFIED_ON_VPS` | `false` | Поставьте `true` только после проверки слушающих сервисов на VPS. |
+
+Убедитесь, что `TEST_DURATION_SECONDS` достаточно для всех попыток. Когда время истечёт, новые попытки пропускаются и помечаются `skipped_deadline`. Для другого IP/порта команда `test` требует ввести точную строку `IP:PORT` или явно передать `--confirm-target IP:PORT`; также требуется подтвердить резервный доступ.
+
+## Команды
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh doctor
+sudo ./tools/syn-probe/syn-probe.sh baseline
+sudo ./tools/syn-probe/syn-probe.sh test
+sudo ./tools/syn-probe/syn-probe.sh status
+sudo ./tools/syn-probe/syn-probe.sh stop
+sudo ./tools/syn-probe/syn-probe.sh report
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario all --phase compare
+```
+
+`doctor` проверяет зависимости, маршрут, версию и хеш nfqws2, `--dry-run`, backend iptables и занятость очереди. Он не меняет firewall и не делает TCP connect. `baseline` делает несколько connect без изменения firewall и без запуска nfqws2; при включённом захвате временно запускает tcpdump. `test` повторяет connect с временным правилом для SYN и nfqws2 `--lua-desync=syndata`. `status` показывает состояние собственного процесса и правила. `report` пересоздаёт отчёт последнего запуска; конкретный каталог можно передать через `--report-dir`.
+
+Для неинтерактивного запуска `test` нужны оба явных параметра:
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh test \
+  --confirm-target 72.56.124.34:25531 --ack-recovery
+```
+
+`--ack-recovery` означает, что оператор **сам проверил** резервный доступ. Скрипт не может гарантировать его наличие. Никогда не запускайте такую команду автоматически при загрузке.
+
+## Временная и адаптивная диагностика
+
+Команда `adaptive` по умолчанию выполняет **один и тот же ограниченный план** сначала как baseline, затем с `syndata`. Перед любым запуском adaptive требует подтверждения `TARGET_IP:TARGET_PORT` и резервного доступа. Для отдельного сценария используйте `--scenario cooldown|burst|tls|ports|recovery`, для одной фазы — `--phase baseline|syndata`. Например:
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario cooldown --phase compare
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario burst --phase compare
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario recovery --phase baseline
+```
+
+`cooldown` делает одну проверку, затем по одной после пауз **30, 60, 120 и 180 секунд**. Паузы последовательные: это четыре отдельных окна наблюдения, без постоянного polling. `burst` делает проверку до серии, не более 10 последовательных соединений с частотой не выше 2/с, затем проверку после неё. `recovery` проверяет доступность после заданных интервалов; оценка момента восстановления лежит **между последней неудачной и первой удачной попытками**. Если удачной попытки нет, срок восстановления остаётся неизвестным. Отчёт не объявляет IP статически заблокированным.
+
+TLS включается только при известном совместимом TLS-сервисе. Стандартный клиент Python проверяет сертификат и имя сервера. TCP connect и TLS handshake записываются отдельно; успешный TCP при ошибке TLS не считается успешным TLS. Для проверки:
+
+```dotenv
+TLS_TEST_PORT=443
+TLS_SERVER_NAME=vpn.example.net
+```
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario tls --phase compare
+```
+
+Для сравнения портов сначала на **собственном VPS** проверьте, что сервисы действительно слушают указанные порты, например `sudo ss -ltn`. Не включайте порт SSH и порты управления. Затем явно перечислите проверенные порты на клиенте:
+
+```dotenv
+PORT_COMPARISON_PORTS=443,8443
+PORTS_VERIFIED_ON_VPS=true
+```
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh adaptive --scenario ports --phase compare \
+  --confirm-ports 443,8443
+```
+
+При запуске без терминала также нужны `--confirm-target 72.56.124.34:25531 --ack-recovery`. Для `--scenario all` портовые и TLS-проверки пропускаются, пока их параметры не настроены. Очередь syndata воздействует только на основной `TARGET_PORT`; дополнительные порты являются контрольными измерениями. Каждый план ограничен 40 попытками, проверяет верхнюю оценку длительности до запуска и не выполняет стресс-тест.
+
+Каждая фаза сохраняет `timeline.csv` с UTC-временем, этапом, портом, раздельными статусами TCP/TLS и задержками TCP connect и TLS handshake. `report.json` и `summary.md` содержат временную шкалу, сравнение одинаковых этапов baseline/syndata, пауз, серии, портов, интервальную оценку восстановления и альтернативные причины — маршрут, firewall и состояние сервиса. Время между наблюдениями задаёт точность оценки. Порядок фаз фиксирован, поэтому изменение внешних условий между ними остаётся возможным объяснением. Клиентский pcap ограничен основным `TARGET_PORT`; дополнительные порты измеряются через `socket.connect`.
+
+## Изоляция и откат
+
+Правило добавляется только в `mangle/OUTPUT` и совпадает с `tcp`, точным `-d TARGET_IP`, `--dport TARGET_PORT`, `--tcp-flags SYN,ACK SYN`; пакеты с mark nfqws2 исключены, чтобы избежать петли. Используется отдельная очередь, уникальный комментарий `3b-syn-probe-<run-id>` и `--queue-bypass`. Глобальные таблицы, цепочки, маршруты и конфигурации Xray не меняются. Очередь проверяется по `/proc/net/netfilter/nfnetlink_queue`, `iptables-save` и, если доступен, `nft list ruleset`.
+
+Состояние хранится атомарно в `/run/3b-syn-probe/state.json`. До установки правила запускается отдельный watchdog-процесс. По истечении срока он удаляет **только точное собственное правило** и завершает записанный nfqws2-процесс после проверки PID и времени старта. `SIGINT`/`SIGTERM` и обычное завершение также запускают cleanup. При аварии основного процесса watchdog остаётся работать. При ошибке удаления состояние сохраняется для повторного `stop`.
+
+Экстренный останов:
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh stop
+sudo ./tools/syn-probe/syn-probe.sh status
+```
+
+Если главный процесс аварийно завершился, дождитесь срока watchdog или вызовите `stop`; затем проверьте `status` и поле `rule_remaining` в `rollback.json`. Повторный `test` отказывается запускаться, пока существует прежнее состояние. Не используйте общий `3B/stop.sh`: он предназначен для других процессов.
+
+При повреждении состояния, когда штатный `stop` невозможен, найдите в `iptables-save -t mangle` **только** правило с комментарием `3b-syn-probe-<run-id>` и удалите точную запись `iptables -t mangle -D OUTPUT ...` с теми же условиями. Не очищайте OUTPUT или всю таблицу. Этот ручной путь нужен только для аварийного случая.
+
+## Данные и интерпретация
+
+Каждый запуск создаёт `reports/syn-probe/YYYYMMDD-HHMMSS-<id>/`. Там сохраняются `metadata.json`, `environment.txt`, снимки `firewall-before.txt` и `firewall-after.txt`, `baseline.json` или `experiment.json`, `tcpdump-client.pcap` при доступности, `nfqws-debug.log` в эксперименте, `rollback.json`, `report.json`, `summary.md`.
+
+Посмотреть последний отчёт:
+
+```bash
+sudo ./tools/syn-probe/syn-probe.sh report
+find reports/syn-probe -name summary.md -print
+```
+
+Успешный `socket.connect` означает завершение TCP handshake **на клиенте**. Счётчики SYN/SYN/ACK/RST считаются из TCP-флагов pcap и включают повторные передачи. По одному pcap надёжное число завершённых handshake не выводится и помечается `unknown`. Отсутствие pcap или результата помечается `unavailable`/`N/A`, а не нулём. Счётчик `queue_rule_packets` берётся из `iptables -nvxL OUTPUT`. Только клиентский захват не показывает, где исчез пакет: для подтверждения участка нужен одновременный захват на VPS. Таймаут не является доказательством блокировки ТСПУ.
+
+Если `queue_rule_packets=0`, стратегия не была проверена: правило не увидело SYN. Если счётчик растёт, но успешных connect нет, сопоставьте клиентский и серверный pcap. Если connect проходит, отдельно проверьте Xray/VLESS — TCP-доступность не подтверждает работу протокола.
+
+## Удаление модуля
+
+Вызовите `stop`, убедитесь по `status`, что правила и процесс отсутствуют, затем удалите `tools/syn-probe` и, при желании, `reports/syn-probe`. Работающий 3B при этом не затрагивается. Отчёты и pcap могут содержать сетевые метаданные; храните их как диагностические данные.
+
+## Тесты
+
+Обычные unit-тесты не меняют firewall и не открывают сетевые соединения:
+
+```bash
+python3 -m unittest discover -s tools/syn-probe/tests -v
+```
+
+Реальных integration-тестов netfilter в обычном наборе нет. Первый запуск на Ubuntu с правами root и реальным маршрутом остаётся отдельной контролируемой проверкой.

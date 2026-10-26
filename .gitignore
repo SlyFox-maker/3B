@@ -3,6 +3,7 @@
 *.log
 /logs/*
 !/logs/.gitkeep
+/reports/syn-probe/
 *.pid
 *.tmp
 /.env
