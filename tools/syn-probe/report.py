@@ -64,10 +64,13 @@ def render(directory, cfg):
     result = {'schema_version': 1, 'target': {'ip': cfg['TARGET_IP'], 'port': cfg['TARGET_PORT']},
               'environment': metadata, 'baseline': baseline, 'experiment': experiment,
               'metrics': {'baseline': b, 'syndata': e}, 'rollback': rollback,
+              'syndata_effect_confirmed': False,
               'limitations': ['Client-only capture cannot locate the drop hop.',
                               'PCAP flag counters include retransmissions and cannot prove a complete handshake.',
                               'A completed socket.connect is the source for successful handshake counts.',
-                              'Server-side capture is required to distinguish forward from return-path loss.']}
+                              'Server-side capture is required to distinguish forward from return-path loss.',
+                              'Python ssl only checks a conventional TLS handshake, not Xray, VLESS or REALITY.',
+                              'Sequential baseline and syndata are not a randomized A/B test.']}
     if (baseline or {}).get('adaptive_plan') or (experiment or {}).get('adaptive_plan'):
         result['adaptive_comparison'] = adaptive.compare(baseline, experiment)
         result['alternative_explanations'] = [
@@ -103,7 +106,9 @@ def render(directory, cfg):
     experiment_ok = e is not None
     if experiment_ok and baseline_ok:
         if e['successful_connections'] > b['successful_connections']:
-            interpretation = 'В этом клиентском замере успешных connect с syndata больше, чем в baseline. Повторите проверку и сопоставьте с серверным захватом.'
+            interpretation = ('В этом клиентском замере успешных connect во второй фазе больше. '
+                              'Причинное действие syndata не подтверждено: фазы последовательны; '
+                              'сопоставьте журналы, клиентский и серверный захват.')
         else:
             interpretation = 'В этом замере улучшение успешных connect не подтверждено.'
     else:
@@ -134,14 +139,35 @@ def render(directory, cfg):
              '- Одновременно снять пакеты на клиенте и на VPS для этого IP и порта.',
              '- Проверить, пришёл ли SYN на VPS и вышел ли обратный SYN/ACK.',
              '- Повторить несколько серий в сопоставимых условиях; таймаут сам по себе не доказывает блокировку ТСПУ.', '']
+    if experiment:
+        evidence = experiment.get('interception_evidence') or {}
+        integrity = experiment.get('firewall_integrity') or {}
+        lines += ['## Уровни подтверждения', '',
+                  f"- Правило NFQUEUE увидело пакеты: {fmt(evidence.get('nfqueue_hit'))}; "
+                  f"счётчик: {fmt(evidence.get('nfqueue_rule_packets'))}.",
+                  f"- nfqws2 записал вызовы syndata: {fmt(evidence.get('syndata_invocations_logged'))}; "
+                  'это свидетельство выполнения Lua-действия, не доставки пакета.',
+                  f"- Клиентский pcap увидел исходящие SYN с данными: "
+                  f"{fmt(evidence.get('outgoing_syn_payload_packets'))}; "
+                  'без серверного захвата модификация и доставка не подтверждены.',
+                  f"- Собственное экспериментальное правило осталось: "
+                  f"{fmt(integrity.get('own_rule_remaining'))}.",
+                  f"- Изменение структуры других правил: "
+                  f"{fmt(integrity.get('foreign_rules_changed'))}; "
+                  f"изменение динамических счётчиков: "
+                  f"{fmt(integrity.get('dynamic_counter_changes'))}; "
+                  f"только счётчики или сырой снимок: "
+                  f"{fmt(integrity.get('dynamic_or_raw_changes'))}.", '']
     if (baseline or {}).get('adaptive_plan') or (experiment or {}).get('adaptive_plan'):
         lines += ['## Временная шкала', '',
-                  '| UTC | Фаза | Сценарий | Этап | Порт | Протокол | TCP | TLS | Итог |',
-                  '|---|---|---|---|---:|---|---|---|---|']
+                  '| UTC | Фаза | Сценарий | Этап | Пауза, с | Накоплено, с | Порт | Протокол | TCP | TLS | Итог |',
+                  '|---|---|---|---|---:|---:|---:|---|---|---|---|']
         for phase, data in (('baseline', baseline), ('syndata', experiment)):
             for item in (data or {}).get('attempts', []):
                 lines.append(f"| {item.get('timestamp_utc', 'N/A')} | {phase} | "
                              f"{item.get('scenario', 'N/A')} | {item.get('stage', 'N/A')} | "
+                             f"{item.get('wait_before_seconds', 'N/A')} | "
+                             f"{item.get('cumulative_planned_wait_seconds', 'N/A')} | "
                              f"{item.get('port', 'N/A')} | {item.get('protocol', 'N/A')} | "
                              f"{item.get('tcp_status', 'unknown')} | "
                              f"{item.get('tls_status', 'not_tested')} | {item.get('status', 'N/A')} |")
@@ -156,8 +182,10 @@ def render(directory, cfg):
                          f"{analysis.get('tls_successes', 0)}, TLS не завершено "
                          f"{analysis.get('tls_failures', 0)}.")
             for pause in analysis.get('cooldown_before_after', []):
-                lines.append(f"- {phase}: пауза {pause['wait_seconds']} с: "
-                             f"{pause['before']} → {pause['after']}.")
+                lines.append(f"- {phase}: последовательная пауза {pause['wait_seconds']} с "
+                             f"(накоплено {pause['cumulative_planned_wait_seconds']} с): "
+                             f"{pause['before']} [{pause['before_utc']}] → "
+                             f"{pause['after']} [{pause['after_utc']}].")
             burst = analysis.get('burst_before_after') or {}
             if burst.get('before') is not None:
                 lines.append(f"- {phase}: серия соединений: до {burst['before']}, "
@@ -171,20 +199,20 @@ def render(directory, cfg):
                              'TCP connect успешны; различие портов само по себе не доказывает фильтрацию.')
             for period in analysis.get('unavailable_periods', []):
                 if period['status'] == 'interval_censored':
-                    lines.append(f"- {phase}: наблюдаемая недоступность с "
+                    lines.append(f"- {phase}/{period.get('scenario', 'unknown')}: наблюдаемая недоступность с "
                                  f"{period['first_failure_utc']} до {period['last_failure_utc']}; "
                                  f"наблюдаемый минимум {period['failure_observed_span_seconds']} с; "
                                  f"доступность вернулась не позднее {period['first_success_utc']}. "
                                  f"Точность по времени: интервал {period['observation_gap_seconds']} с.")
                 else:
-                    lines.append(f"- {phase}: после {period['last_failure_utc']} "
+                    lines.append(f"- {phase}/{period.get('scenario', 'unknown')}: после {period['last_failure_utc']} "
                                  f"восстановление не наблюдалось (наблюдаемый минимум "
                                  f"{period['failure_observed_span_seconds']} с); "
                                  'срок восстановления неизвестен.')
         comparison = result['adaptive_comparison']
         lines += ['', '## Сопоставление одинаковых этапов', '',
                   f"Статус: {comparison['status']}. "
-                  'Фазы идут последовательно, поэтому совпадение или разница не доказывает причину.', '']
+                  'Это не строгий A/B-тест: фазы идут последовательно, сетевые условия между ними могут измениться.', '']
         if comparison.get('paired_measurements'):
             lines += ['| Сценарий | Этап | Порт | Подпадает под правило | TCP baseline | TCP syndata | TLS baseline | TLS syndata |',
                       '|---|---|---:|---|---|---|---|---|']
@@ -203,6 +231,9 @@ def render(directory, cfg):
                   '- Baseline и syndata используют одинаковый план, но идут последовательно; '
                   'внешние сетевые условия могли измениться.',
                   '- Для локализации потерь нужен синхронный захват пакетов на клиенте и VPS.', '']
+        lines += ['## Граница TLS-проверки', '',
+                  'Python ssl проверяет обычный TLS handshake и сертификат. Успех не подтверждает Xray, '
+                  'VLESS, REALITY или корректность приложения.', '']
     if 'markdown' in cfg['REPORT_FORMATS']:
         (directory / 'summary.md').write_text('\n'.join(lines))
     return result

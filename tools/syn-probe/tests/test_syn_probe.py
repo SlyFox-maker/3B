@@ -1,8 +1,10 @@
 import json
+import contextlib
 import os
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -128,6 +130,162 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(outcome['rollback'], 'failed')
         self.assertTrue(probe.STATE_FILE.exists())
 
+    def test_cleanup_is_idempotent_and_watchdog_retries_failed_deletion(self):
+        self.assertEqual(probe.cleanup()['rollback'], 'not needed')
+        self.state()
+        calls = []
+        def delete(action, rule, check=True):
+            calls.append(action)
+            if calls.count('-D') == 1:
+                raise probe.ProbeError('transient deletion failure')
+            return True
+        present = iter([True, True, True, False])
+        with mock.patch.object(probe, 'rule_present', side_effect=lambda rule: next(present)), \
+             mock.patch.object(probe, 'ipt', side_effect=delete), \
+             mock.patch.object(probe, 'stop_owned_process'), \
+             mock.patch.object(probe.time, 'sleep'):
+            self.assertEqual(probe.watchdog('a1'), 0)
+        self.assertEqual(calls.count('-D'), 2)
+        self.assertFalse(probe.STATE_FILE.exists())
+        self.assertEqual(probe.cleanup()['rollback'], 'not needed')
+
+    def test_watchdog_retries_if_nfqws_process_survives_first_cleanup(self):
+        self.state()
+        outcomes = iter([False, True])
+        with mock.patch.object(probe, 'rule_present', return_value=False), \
+             mock.patch.object(probe, 'stop_owned_process',
+                               side_effect=lambda pid, start: next(outcomes) if pid == 123 else True), \
+             mock.patch.object(probe.time, 'sleep'):
+            # Only the nfqws process has an identity in this state.
+            state = probe.read_json(probe.STATE_FILE)
+            state['nfq_pid'], state['nfq_starttime'] = 123, '77'
+            probe.write_json(probe.STATE_FILE, state)
+            self.assertEqual(probe.watchdog('a1'), 0)
+        self.assertFalse(probe.STATE_FILE.exists())
+
+    def test_zombie_owned_process_does_not_keep_rollback_open(self):
+        with mock.patch.object(probe, 'proc_starttime', return_value='77'), \
+             mock.patch.object(probe, 'proc_state', return_value='Z'), \
+             mock.patch.object(probe.os, 'kill') as kill:
+            self.assertTrue(probe.stop_owned_process(123, '77'))
+        kill.assert_not_called()
+
+    def test_watchdog_readiness_requires_child_acknowledgement(self):
+        process = mock.Mock(pid=101, poll=mock.Mock(return_value=None))
+        with mock.patch.object(probe, 'proc_starttime', return_value='77'):
+            with self.assertRaisesRegex(probe.ProbeError, 'acknowledge'):
+                probe.await_watchdog_ready(process, 'a1', timeout=0.01)
+            probe.write_json(probe.watchdog_ready_path('a1'),
+                             {'run_id': 'a1', 'pid': 101, 'starttime': '77'})
+            probe.await_watchdog_ready(process, 'a1', timeout=0.01)
+        process.poll.return_value = 1
+        with self.assertRaisesRegex(probe.ProbeError, 'exited'):
+            probe.await_watchdog_ready(process, 'a1', timeout=0.01)
+
+    def test_refuses_firewall_install_when_watchdog_not_ready(self):
+        directory = self.base / 'report'
+        directory.mkdir()
+        process = mock.Mock(pid=101, poll=mock.Mock(return_value=None))
+        with contextlib.ExitStack() as stack:
+            for patch in [mock.patch.object(probe, 'readiness', return_value='v1.0.4'),
+                          mock.patch.object(probe, 'management_info', return_value={'target_rule_matches_ssh': False}),
+                          mock.patch.object(probe, 'ssh_target_conflict', return_value=False),
+                          mock.patch.object(probe, 'queue_conflict', return_value=None),
+                          mock.patch.object(probe, 'new_report_dir', return_value=directory),
+                          mock.patch.object(probe, 'snapshot', side_effect=lambda path: path.write_text('rules')),
+                          mock.patch.object(probe, 'route_info', return_value={}),
+                          mock.patch.object(probe, 'proc_starttime', return_value='77'),
+                          mock.patch.object(probe, 'rule_present', return_value=False),
+                          mock.patch.object(probe, 'stop_owned_process'),
+                          mock.patch.object(probe.subprocess, 'Popen', return_value=process),
+                          mock.patch.object(probe, 'await_watchdog_ready',
+                                            side_effect=probe.ProbeError('no acknowledgement'))]:
+                stack.enter_context(patch)
+            insert = stack.enter_context(mock.patch.object(probe, 'ipt'))
+            with self.assertRaisesRegex(probe.ProbeError, 'no acknowledgement'):
+                probe.do_test(self.cfg, mock.Mock(), confirmed=True)
+            insert.assert_not_called()
+        self.assertFalse(probe.STATE_FILE.exists())
+
+    def test_nfqws_exit_prevents_firewall_install(self):
+        process = mock.Mock(poll=mock.Mock(return_value=1))
+        with self.assertRaisesRegex(probe.ProbeError, 'nfqws2 exited'):
+            probe.await_nfqws_queue_ready(process, 129, self.base / 'missing', timeout=0.01)
+
+    def test_do_test_nfqws_crash_keeps_rule_uninstalled_and_report(self):
+        directory = self.base / 'report'
+        directory.mkdir()
+        ready = self.base / 'ready'
+        ready.touch()
+        watchdog = mock.Mock(pid=100, poll=mock.Mock(return_value=None))
+        nfqws = mock.Mock(pid=101, poll=mock.Mock(return_value=1))
+        with contextlib.ExitStack() as stack:
+            for patch in [mock.patch.object(probe, 'readiness', return_value='v1.0.4'),
+                          mock.patch.object(probe, 'management_info', return_value={'target_rule_matches_ssh': False}),
+                          mock.patch.object(probe, 'ssh_target_conflict', return_value=False),
+                          mock.patch.object(probe, 'queue_conflict', return_value=None),
+                          mock.patch.object(probe, 'new_report_dir', return_value=directory),
+                          mock.patch.object(probe, 'snapshot', side_effect=lambda path: path.write_text('rules')),
+                          mock.patch.object(probe, 'route_info', return_value={}),
+                          mock.patch.object(probe, 'proc_starttime', return_value='77'),
+                          mock.patch.object(probe, 'rule_present', return_value=False),
+                          mock.patch.object(probe, 'stop_owned_process'),
+                          mock.patch.object(probe, 'packet_counts', return_value={'handshakes': 'unknown'}),
+                          mock.patch.object(probe, 'generate_report'),
+                          mock.patch.object(probe, 'await_watchdog_ready'),
+                          mock.patch.object(probe, 'watchdog_ready_path', return_value=ready),
+                          mock.patch.object(probe.subprocess, 'Popen', side_effect=[watchdog, nfqws])]:
+                stack.enter_context(patch)
+            insert = stack.enter_context(mock.patch.object(probe, 'ipt'))
+            with self.assertRaisesRegex(probe.ProbeError, 'inspect report'):
+                probe.do_test(self.cfg, mock.Mock(), confirmed=True)
+            insert.assert_not_called()
+        saved = probe.read_json(directory / 'experiment.json')
+        self.assertEqual(saved['status'], 'partial')
+        self.assertIn('nfqws2 exited', saved['errors'][0])
+        self.assertFalse(probe.STATE_FILE.exists())
+
+    def test_queue_listener_without_nfqws_bind_log_is_not_ready(self):
+        log = self.base / 'nfqws.log'
+        log.write_text('unrelated listener\n')
+        process = mock.Mock(poll=mock.Mock(return_value=None))
+        with mock.patch.object(probe, 'queue_conflict', return_value='listener'), \
+             mock.patch.object(probe.time, 'sleep'):
+            with self.assertRaisesRegex(probe.ProbeError, 'not confirmed'):
+                probe.await_nfqws_queue_ready(process, 129, log, timeout=0.01)
+
+    def test_firewall_integrity_separates_counters_and_foreign_rules(self):
+        directory = self.base
+        (directory / 'firewall-before.txt').write_text('# Generated by iptables-save on t1\nunchanged\n# Completed on t1\n')
+        (directory / 'firewall-after.txt').write_text('# Generated by iptables-save on t2\nunchanged\n# Completed on t2\n')
+        (directory / 'firewall-before.nft.txt').write_text('counter packets 1 bytes 40 # handle 5\n')
+        (directory / 'firewall-after.nft.txt').write_text('counter packets 2 bytes 80 # handle 5\n')
+        result = probe.firewall_integrity(directory)
+        self.assertFalse(result['foreign_rules_changed'])
+        self.assertTrue(result['dynamic_or_raw_changes'])
+        (directory / 'firewall-after.txt').write_text('foreign rule added\n')
+        changed = probe.firewall_integrity(directory)
+        self.assertTrue(changed['foreign_rules_changed'])
+        self.assertTrue(changed['dynamic_counter_changes'])
+
+    def test_interception_evidence_levels_are_distinct(self):
+        path = self.base / 'nfqws-debug.log'
+        path.write_text('packet: id=1\nLUA: syndata: 00 00\n')
+        evidence = probe.interception_evidence(2, path, {'outgoing_syn_payload': None})
+        self.assertTrue(evidence['nfqueue_hit'])
+        self.assertTrue(evidence['nfqws_action_observed'])
+        self.assertIsNone(evidence['outgoing_syn_payload_observed'])
+        self.assertFalse(evidence['modified_packet_confirmed'])
+
+    def test_client_pcap_syn_payload_is_only_candidate_evidence(self):
+        (self.base / 'tcpdump-client.pcap').write_bytes(b'pcap')
+        output = ('1 IP 192.0.2.2.55555 > 72.56.124.34.25531: Flags [S], seq 1, length 16\n'
+                  '2 IP 72.56.124.34.25531 > 192.0.2.2.55555: Flags [S.], seq 2, length 0\n')
+        with mock.patch.object(probe, 'run', return_value=mock.Mock(returncode=0, stdout=output)):
+            counts = probe.packet_counts(self.base, self.cfg)
+        self.assertEqual(counts['outgoing_syn_payload'], 1)
+        self.assertEqual(counts['syn_ack'], 1)
+
     def test_firewall_check_error_is_not_treated_as_absent_rule(self):
         self.state()
         with mock.patch.object(probe, 'run', return_value=mock.Mock(returncode=4, stdout='permission denied')):
@@ -145,6 +303,17 @@ class IsolationTests(unittest.TestCase):
         self.assertFalse(probe.STATE_FILE.exists())
         self.state('b2')
         self.assertEqual(probe.read_json(probe.STATE_FILE)['run_id'], 'b2')
+
+    def test_watchdog_uses_monotonic_deadline_when_wall_clock_moves_back(self):
+        self.state()
+        state = probe.read_json(probe.STATE_FILE)
+        state['deadline_epoch'] = time.time() + 10000
+        state['deadline_monotonic'] = time.monotonic() - 1
+        probe.write_json(probe.STATE_FILE, state)
+        with mock.patch.object(probe, 'rule_present', return_value=False), \
+             mock.patch.object(probe, 'stop_owned_process'):
+            self.assertEqual(probe.watchdog('a1'), 0)
+        self.assertFalse(probe.STATE_FILE.exists())
 
     def test_parallel_lock_and_stale_watchdog(self):
         self.state('new')
@@ -181,6 +350,15 @@ class IsolationTests(unittest.TestCase):
             cfg = dict(self.cfg, TEST_ATTEMPTS=1)
             attempts = probe.connect_attempts(cfg, deadline=10)
         self.assertEqual(attempts[0]['status'], 'overlapped_watchdog')
+
+    def test_connect_attempts_journal_survives_partial_run(self):
+        path = self.base / 'attempts.live.jsonl'
+        with mock.patch.object(probe.socket, 'create_connection') as connector:
+            connector.return_value.__enter__.return_value = None
+            rows = probe.connect_attempts(dict(self.cfg, TEST_ATTEMPTS=2), journal=path)
+        saved = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(saved, rows)
+        self.assertEqual(len(saved), 2)
 
 
 class ReportTests(unittest.TestCase):

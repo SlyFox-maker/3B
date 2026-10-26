@@ -62,6 +62,11 @@ class AdaptiveTests(unittest.TestCase):
                 adaptive.execute(self.cfg, steps, 'baseline', Path(temp), attempts)
             self.assertEqual([c.args[0] for c in sleep.call_args_list], [30, 60, 120, 180])
             self.assertEqual(len(attempts), 5)
+            self.assertEqual([a['cumulative_planned_wait_seconds'] for a in attempts],
+                             [0, 30, 90, 210, 390])
+            analysis = adaptive.analyze(attempts)
+            self.assertEqual([x['cumulative_planned_wait_seconds']
+                              for x in analysis['cooldown_before_after']], [30, 90, 210, 390])
             with (Path(temp) / 'timeline.csv').open() as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 5)
 
@@ -77,6 +82,16 @@ class AdaptiveTests(unittest.TestCase):
             self.assertEqual(connect.call_count, 1)
             sleep.assert_not_called()
             self.assertEqual([a['status'] for a in attempts[1:]], ['skipped_deadline'] * 4)
+
+    def test_monotonic_deadline_skips_even_if_wall_clock_deadline_is_far_away(self):
+        with tempfile.TemporaryDirectory() as temp:
+            attempts = []
+            with mock.patch.object(adaptive, '_once') as connect:
+                adaptive.execute(self.cfg, adaptive.plan(self.cfg, 'burst'), 'syndata',
+                                 Path(temp), attempts, deadline=adaptive.time.time() + 9999,
+                                 monotonic_deadline=adaptive.time.monotonic() - 1)
+            connect.assert_not_called()
+            self.assertTrue(all(a['status'] == 'skipped_deadline' for a in attempts))
 
     def test_tls_failure_keeps_successful_tcp_distinct(self):
         cfg = dict(self.cfg, TLS_TEST_PORT=443, TLS_SERVER_NAME='vpn.example.test')
@@ -103,6 +118,20 @@ class AdaptiveTests(unittest.TestCase):
         self.assertEqual(analysis['unavailable_periods'][0]['status'], 'interval_censored')
         self.assertEqual(analysis['unavailable_periods'][0]['observation_gap_seconds'], 15)
         self.assertEqual(analysis['tcp_successes'], 1)
+
+    def test_recovery_periods_do_not_cross_scenario_boundaries(self):
+        rows = [
+            {'protocol': 'tcp', 'status': 'timeout', 'tcp_status': 'timeout',
+             'port': 25531, 'scenario': 'cooldown', 'stage': 'initial',
+             'elapsed_seconds': 0, 'timestamp_utc': 't0'},
+            {'protocol': 'tcp', 'status': 'connected', 'tcp_status': 'connected',
+             'port': 25531, 'scenario': 'burst', 'stage': 'before',
+             'elapsed_seconds': 30, 'timestamp_utc': 't1'},
+        ]
+        periods = adaptive.analyze(rows)['unavailable_periods']
+        self.assertEqual(len(periods), 1)
+        self.assertEqual(periods[0]['status'], 'right_censored')
+        self.assertEqual(periods[0]['scenario'], 'cooldown')
 
     def test_comparison_refuses_different_schedules(self):
         self.assertEqual(adaptive.compare({'adaptive_plan': [1], 'attempts': []},
@@ -152,13 +181,18 @@ class AdaptiveTests(unittest.TestCase):
                     mock.patch.object(probe, 'snapshot', side_effect=lambda path: path.write_text('rules')),
                     mock.patch.object(probe, 'start_capture', return_value=None),
                     mock.patch.object(probe, 'proc_starttime', return_value='123'),
+                    mock.patch.object(probe, 'await_watchdog_ready'),
+                    mock.patch.object(probe, 'await_nfqws_queue_ready'),
+                    mock.patch.object(probe, 'watchdog_ready_path', return_value=base / 'ready'),
                     mock.patch.object(probe, 'stop_owned_process'),
                     mock.patch.object(probe, 'packet_counts', return_value={'handshakes': 'unknown'}),
+                    mock.patch.object(probe, 'run', return_value=mock.Mock(returncode=0, stdout='')),
                     mock.patch.object(probe, 'generate_report'),
                 ]
                 for patch in patches:
                     stack.enter_context(patch)
                 (base / 'report').mkdir()
+                (base / 'ready').touch()
                 rules = []
                 def ipt(action, rule, check=True):
                     if action == '-I':
@@ -179,6 +213,7 @@ class AdaptiveTests(unittest.TestCase):
                 self.assertEqual(rules, [])
                 self.assertFalse((base / 'run/state.json').exists())
                 self.assertEqual(probe.read_json(base / 'report/rollback.json')['rollback'], 'complete')
+                self.assertTrue((base / 'report/queue-counters.txt').exists())
 
     def test_adaptive_report_contains_timeline_and_alternatives(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -201,6 +236,8 @@ class AdaptiveTests(unittest.TestCase):
             self.assertIn('Временная шкала', summary)
             self.assertIn('Сопоставление одинаковых этапов', summary)
             self.assertIn('Альтернативные объяснения', summary)
+            self.assertIn('не строгий A/B-тест', summary)
+            self.assertIn('REALITY', summary)
             self.assertEqual(result['metrics']['baseline']['tcp_attempts'], 1)
             self.assertEqual(result['adaptive_comparison']['status'], 'complete')
 

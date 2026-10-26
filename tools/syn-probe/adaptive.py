@@ -24,7 +24,8 @@ SCENARIOS = ('all', 'cooldown', 'burst', 'tls', 'ports', 'recovery')
 COOLDOWNS = (30, 60, 120, 180)
 CSV_FIELDS = ('started_utc', 'timestamp_utc', 'phase', 'scenario', 'stage', 'target_ip', 'port',
               'protocol', 'syndata_eligible', 'status', 'tcp_status', 'tls_status', 'latency_ms',
-              'tls_latency_ms', 'error', 'elapsed_seconds')
+              'tls_latency_ms', 'error', 'elapsed_seconds', 'wait_before_seconds',
+              'actual_wait_seconds', 'cumulative_planned_wait_seconds')
 
 
 def validate(values):
@@ -164,8 +165,12 @@ def _once(cfg, step):
     return status, tcp_status, tls_status, error, tcp_latency, tls_latency
 
 
-def execute(cfg, steps, phase, directory, attempts, deadline=None):
+def execute(cfg, steps, phase, directory, attempts, deadline=None, monotonic_deadline=None):
     """Append each measurement to CSV immediately so cancellation retains partial evidence."""
+    def expires_within(seconds):
+        return ((deadline is not None and time.time() + seconds >= deadline)
+                or (monotonic_deadline is not None
+                    and time.monotonic() + seconds >= monotonic_deadline))
     path = directory / 'timeline.csv'
     started = time.monotonic()
     with path.open('w', newline='') as handle:
@@ -173,15 +178,19 @@ def execute(cfg, steps, phase, directory, attempts, deadline=None):
         writer.writeheader()
         handle.flush()
         skip_rest = False
+        cumulative_wait = 0
         for step in steps:
             wait = step['wait_before_seconds']
+            cumulative_wait += wait
+            before_wait = time.monotonic()
             needed = cfg['CONNECT_TIMEOUT_SECONDS'] * (2 if step['protocol'] == 'tls' else 1)
-            if deadline is not None and time.time() + wait + needed >= deadline:
+            if expires_within(wait + needed):
                 skip_rest = True
             if wait and not skip_rest:
                 # One bounded sleep per interval; no continuous polling.
                 time.sleep(wait)
-            if deadline is not None and time.time() + needed >= deadline:
+            actual_wait = round(time.monotonic() - before_wait, 3) if not skip_rest else 0
+            if expires_within(needed):
                 skip_rest = True
             if skip_rest:
                 started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -191,7 +200,7 @@ def execute(cfg, steps, phase, directory, attempts, deadline=None):
             else:
                 started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
                 status, tcp_status, tls_status, error, latency, tls_latency = _once(cfg, step)
-                if deadline is not None and time.time() >= deadline:
+                if expires_within(0):
                     status = 'overlapped_watchdog'
                     error = 'measurement crossed the rollback deadline'
             row = {'started_utc': started_utc,
@@ -203,7 +212,9 @@ def execute(cfg, steps, phase, directory, attempts, deadline=None):
                    'status': status,
                    'tcp_status': tcp_status, 'tls_status': tls_status,
                    'latency_ms': latency, 'tls_latency_ms': tls_latency, 'error': error,
-                   'elapsed_seconds': round(time.monotonic() - started, 3)}
+                   'elapsed_seconds': round(time.monotonic() - started, 3),
+                   'wait_before_seconds': wait, 'actual_wait_seconds': actual_wait,
+                   'cumulative_planned_wait_seconds': cumulative_wait}
             attempts.append(row)
             writer.writerow(row)
             handle.flush()
@@ -216,29 +227,31 @@ def analyze(attempts, primary_port=None):
            and a.get('status') not in ('skipped_deadline', 'overlapped_watchdog')]
     success = [a for a in tcp if a.get('tcp_status') == 'connected']
     failures = [a for a in tcp if a.get('tcp_status') != 'connected']
-    primary = [a for a in tcp if primary_port is None or a['port'] == primary_port]
     periods = []
-    streak = []
-    for item in primary:
-        if item['tcp_status'] != 'connected':
-            streak.append(item)
-            continue
+    for scenario in dict.fromkeys(a['scenario'] for a in tcp):
+        observations = [a for a in tcp if a['scenario'] == scenario
+                        and (primary_port is None or a['port'] == primary_port)]
+        streak = []
+        for item in observations:
+            if item['tcp_status'] != 'connected':
+                streak.append(item)
+                continue
+            if streak:
+                low = streak[-1]['elapsed_seconds']
+                high = item['elapsed_seconds']
+                periods.append({'scenario': scenario, 'first_failure_utc': streak[0]['timestamp_utc'],
+                                'last_failure_utc': streak[-1]['timestamp_utc'],
+                                'first_success_utc': item['timestamp_utc'],
+                                'recovery_after_last_failure_seconds': {'lower': 0, 'upper': round(high - low, 3)},
+                                'observation_gap_seconds': round(high - low, 3),
+                                'failure_observed_span_seconds': round(low - streak[0]['elapsed_seconds'], 3),
+                                'status': 'interval_censored'})
+                streak = []
         if streak:
-            low = streak[-1]['elapsed_seconds']
-            high = item['elapsed_seconds']
-            periods.append({'first_failure_utc': streak[0]['timestamp_utc'],
+            periods.append({'scenario': scenario, 'first_failure_utc': streak[0]['timestamp_utc'],
                             'last_failure_utc': streak[-1]['timestamp_utc'],
-                            'first_success_utc': item['timestamp_utc'],
-                            'recovery_after_last_failure_seconds': {'lower': 0, 'upper': round(high - low, 3)},
-                            'observation_gap_seconds': round(high - low, 3),
-                            'failure_observed_span_seconds': round(low - streak[0]['elapsed_seconds'], 3),
-                            'status': 'interval_censored'})
-            streak = []
-    if streak:
-        periods.append({'first_failure_utc': streak[0]['timestamp_utc'],
-                        'last_failure_utc': streak[-1]['timestamp_utc'],
-                        'first_success_utc': None, 'status': 'right_censored',
-                        'failure_observed_span_seconds': round(streak[-1]['elapsed_seconds'] - streak[0]['elapsed_seconds'], 3)})
+                            'first_success_utc': None, 'status': 'right_censored',
+                            'failure_observed_span_seconds': round(streak[-1]['elapsed_seconds'] - streak[0]['elapsed_seconds'], 3)})
     by_port = {}
     for item in tcp:
         key = str(item['port'])
@@ -254,11 +267,19 @@ def analyze(attempts, primary_port=None):
         value['attempts'] += 1
         value['connected' if item['tcp_status'] == 'connected' else 'failed'] += 1
     cooldown = []
-    points = [a for a in tcp if a['scenario'] == 'cooldown']
-    for seconds, before, after in zip(COOLDOWNS, points, points[1:]):
+    points = {a['stage']: a for a in tcp if a['scenario'] == 'cooldown'}
+    previous_stage = 'initial'
+    for seconds in COOLDOWNS:
+        before, after = points.get(previous_stage), points.get(f'after_{seconds}s')
+        previous_stage = f'after_{seconds}s'
+        if not before or not after:
+            continue
         cooldown.append({'wait_seconds': seconds, 'before': before['tcp_status'],
                          'after': after['tcp_status'], 'before_utc': before['timestamp_utc'],
-                         'after_utc': after['timestamp_utc']})
+                         'after_utc': after['timestamp_utc'],
+                         'cumulative_planned_wait_seconds': after.get('cumulative_planned_wait_seconds',
+                                                                      sum(COOLDOWNS[:COOLDOWNS.index(seconds) + 1])),
+                         'actual_wait_seconds': after.get('actual_wait_seconds')})
     burst = [a for a in tcp if a['scenario'] == 'burst']
     before = next((a for a in burst if a['stage'] == 'before'), None)
     after = next((a for a in burst if a['stage'] == 'after'), None)
@@ -268,6 +289,7 @@ def analyze(attempts, primary_port=None):
             'tls_failures': len([a for a in attempts if a.get('protocol') == 'tls'
                                  and a.get('tls_status') not in ('completed', 'not_tested')]),
             'cooldown_before_after': cooldown,
+            'cooldown_design': 'sequential pauses in one run; not four independent experiments',
             'burst_before_after': {'before': before['tcp_status'] if before else None,
                                    'after': after['tcp_status'] if after else None,
                                    'during_attempts': len(during),
@@ -304,4 +326,4 @@ def compare(baseline, syndata):
             'paired_measurements': pairs,
             'unpaired_baseline': max(0, len(left) - len(pairs)),
             'unpaired_syndata': max(0, len(right) - len(pairs)),
-            'ordering': 'baseline first, syndata second; environmental drift remains possible'}
+            'ordering': 'baseline first, syndata second; not a randomized A/B test; environmental drift remains possible'}

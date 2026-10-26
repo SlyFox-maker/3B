@@ -202,18 +202,26 @@ def proc_starttime(pid):
         return None
 
 
+def proc_state(pid):
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
 def stop_owned_process(pid, starttime):
-    if not pid or not starttime or proc_starttime(pid) != starttime:
-        return
+    if not pid or not starttime or proc_starttime(pid) != starttime or proc_state(pid) in ('Z', 'X'):
+        return True
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGTERM)
     for _ in range(20):
-        if proc_starttime(pid) != starttime:
-            return
+        if proc_starttime(pid) != starttime or proc_state(pid) in ('Z', 'X'):
+            return True
         time.sleep(0.1)
     if proc_starttime(pid) == starttime:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
+    return proc_starttime(pid) != starttime or proc_state(pid) in ('Z', 'X')
 
 
 @contextlib.contextmanager
@@ -240,34 +248,94 @@ def cleanup(run_id=None):
             except ProbeError as exc:
                 errors.append(str(exc))
         remaining = rule_present(rule)
-        stop_owned_process(state.get('capture_pid'), state.get('capture_starttime'))
-        stop_owned_process(state.get('nfq_pid'), state.get('nfq_starttime'))
+        for kind in ('capture', 'nfq'):
+            try:
+                if stop_owned_process(state.get(f'{kind}_pid'), state.get(f'{kind}_starttime')) is False:
+                    errors.append(f'{kind} process survived termination')
+            except OSError as exc:
+                errors.append(f'{kind} process termination failed: {exc}')
         result = {'rollback': 'failed' if errors or remaining else 'complete',
                   'rule_remaining': remaining, 'errors': errors, 'at': utc_now()}
         report_dir = Path(state['report_dir'])
         write_json(report_dir / 'rollback.json', result)
-        if not remaining:
+        if not errors and not remaining:
             STATE_FILE.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                watchdog_ready_path(state['run_id']).unlink(missing_ok=True)
         return result
 
 
-def watchdog(run_id):
-    while True:
-        if not STATE_FILE.exists():
-            return 0
-        state = read_json(STATE_FILE)
-        if state['run_id'] != run_id:
-            return 0
-        remaining = state['deadline_epoch'] - time.time()
-        if remaining > 0:
-            time.sleep(min(remaining, 1))
-            continue
+def watchdog_ready_path(run_id):
+    return STATE_DIR / f'watchdog-{run_id}.ready.json'
+
+
+def await_watchdog_ready(process, run_id, timeout=5):
+    """Require an acknowledgement written by the watchdog after it read our state."""
+    end = time.monotonic() + timeout
+    path = watchdog_ready_path(run_id)
+    while time.monotonic() < end:
+        if process.poll() is not None:
+            raise ProbeError('watchdog exited before readiness acknowledgement')
         try:
+            ready = read_json(path)
+        except (OSError, ValueError):
+            ready = None
+        starttime = proc_starttime(process.pid)
+        if ready and starttime and ready.get('run_id') == run_id and ready.get('pid') == process.pid \
+                and ready.get('starttime') == starttime:
+            return
+        time.sleep(0.05)
+    raise ProbeError('watchdog did not acknowledge readiness before firewall installation')
+
+
+def await_nfqws_queue_ready(process, queue, log_path, timeout=3):
+    """A listener alone may belong to another process; require nfqws2's bind log too."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if process.poll() is not None:
+            raise ProbeError('nfqws2 exited before queue setup; see nfqws-debug.log')
+        try:
+            output = log_path.read_text(errors='replace')
+        except OSError:
+            output = ''
+        if f"binding this socket to queue '{queue}'" in output and 'setting copy_packet mode' in output \
+                and queue_conflict(queue, read_rules=False):
+            return
+        if 'nfq_create_queue():' in output:
+            raise ProbeError('nfqws2 could not create NFQUEUE; see nfqws-debug.log')
+        time.sleep(0.05)
+    raise ProbeError('nfqws2 queue binding was not confirmed before firewall installation')
+
+
+def watchdog(run_id):
+    if not run_id:
+        raise ProbeError('watchdog run ID required')
+    with locked():
+        if not STATE_FILE.exists() or read_json(STATE_FILE).get('run_id') != run_id:
+            return 0
+        write_json(watchdog_ready_path(run_id),
+                   {'run_id': run_id, 'pid': os.getpid(), 'starttime': proc_starttime(os.getpid()),
+                    'at': utc_now()})
+    while True:
+        try:
+            if not STATE_FILE.exists():
+                return 0
+            state = read_json(STATE_FILE)
+            if state['run_id'] != run_id:
+                return 0
+            remaining = state['deadline_epoch'] - time.time()
+            if 'deadline_monotonic' in state:
+                remaining = min(remaining, state['deadline_monotonic'] - time.monotonic())
+            if remaining > 0:
+                time.sleep(min(remaining, 1))
+                continue
             result = cleanup(run_id)
             if result['rollback'] in ('complete', 'not needed', 'superseded'):
                 return 0
-        except (ProbeError, OSError, BlockingIOError):
-            pass
+        except (ProbeError, OSError, BlockingIOError, ValueError, KeyError) as exc:
+            with contextlib.suppress(OSError):
+                with (STATE_DIR / f'watchdog-{run_id}.log').open('a') as log:
+                    log.write(f'{utc_now()} rollback retry: {exc}\n')
         # A concurrent cleanup or temporary firewall error must not abandon rollback.
         time.sleep(1)
 
@@ -346,6 +414,41 @@ def snapshot(path):
         path.with_suffix('.nft.txt').write_text(result.stdout)
 
 
+def firewall_integrity(directory, own_rule_remaining=False):
+    """Separate our exact rule from unrelated structure and dynamic counters."""
+    before, after = directory / 'firewall-before.txt', directory / 'firewall-after.txt'
+    pairs = [(before, after),
+             (directory / 'firewall-before.nft.txt', directory / 'firewall-after.nft.txt')]
+    if not before.exists() or not after.exists() or any(a.exists() != b.exists() for a, b in pairs):
+        return {'own_rule_remaining': own_rule_remaining, 'foreign_rules_changed': 'unknown',
+                'dynamic_counter_changes': 'unknown', 'dynamic_or_raw_changes': 'unknown'}
+    raw_changed = False
+    structural_changed = False
+    counter_changed = False
+    for first, second in pairs:
+        if not first.exists():
+            continue
+        try:
+            left, right = first.read_text(), second.read_text()
+        except OSError:
+            return {'own_rule_remaining': own_rule_remaining, 'foreign_rules_changed': 'unknown',
+                    'dynamic_counter_changes': 'unknown', 'dynamic_or_raw_changes': 'unknown'}
+        raw_changed |= left != right
+        counter_changed |= (re.findall(r'\bcounter packets \d+ bytes \d+', left)
+                            != re.findall(r'\bcounter packets \d+ bytes \d+', right))
+        def normalized(value):
+            value = '\n'.join(line for line in value.splitlines()
+                              if not line.startswith(('# Generated by iptables-save', '# Completed on')))
+            value = re.sub(r'\bcounter packets \d+ bytes \d+', 'counter', value)
+            value = re.sub(r'\s+# handle \d+', '', value)
+            return value
+        structural_changed |= normalized(left) != normalized(right)
+    return {'own_rule_remaining': own_rule_remaining,
+            'foreign_rules_changed': 'unknown' if own_rule_remaining else structural_changed,
+            'dynamic_counter_changes': counter_changed,
+            'dynamic_or_raw_changes': raw_changed and not structural_changed}
+
+
 def start_capture(cfg, report_dir):
     if not cfg['ENABLE_PACKET_CAPTURE']:
         return None
@@ -370,11 +473,19 @@ def finish_capture(proc):
             proc.wait(timeout=2)
 
 
-def connect_attempts(cfg, deadline=None):
+def connect_attempts(cfg, deadline=None, journal=None, monotonic_deadline=None):
     attempts = []
+    def record(item):
+        attempts.append(item)
+        if journal is not None:
+            with Path(journal).open('a') as handle:
+                handle.write(json.dumps(item, ensure_ascii=False) + '\n')
+                handle.flush()
     for n in range(cfg['TEST_ATTEMPTS']):
-        if deadline is not None and time.time() + cfg['CONNECT_TIMEOUT_SECONDS'] >= deadline:
-            attempts.append({'number': n + 1, 'status': 'skipped_deadline', 'latency_ms': None})
+        if ((deadline is not None and time.time() + cfg['CONNECT_TIMEOUT_SECONDS'] >= deadline)
+                or (monotonic_deadline is not None
+                    and time.monotonic() + cfg['CONNECT_TIMEOUT_SECONDS'] >= monotonic_deadline)):
+            record({'number': n + 1, 'status': 'skipped_deadline', 'latency_ms': None})
             continue
         start = time.monotonic()
         start_epoch = time.time()
@@ -388,25 +499,37 @@ def connect_attempts(cfg, deadline=None):
         except OSError as exc:
             status, error = 'error', f'{type(exc).__name__}: {exc}'
         end_epoch = time.time()
-        if deadline is not None and end_epoch >= deadline:
+        if ((deadline is not None and end_epoch >= deadline)
+                or (monotonic_deadline is not None and time.monotonic() >= monotonic_deadline)):
             status = 'overlapped_watchdog'
             error = 'attempt crossed the automatic rollback deadline; excluded from outcome'
-        attempts.append({'number': n + 1, 'status': status, 'error': error,
-                         'start_epoch': start_epoch, 'end_epoch': end_epoch,
-                         'latency_ms': round((time.monotonic() - start) * 1000, 3)})
+        record({'number': n + 1, 'status': status, 'error': error,
+                'start_epoch': start_epoch, 'end_epoch': end_epoch,
+                'latency_ms': round((time.monotonic() - start) * 1000, 3)})
     return attempts
 
 
 def packet_counts(report_dir, cfg):
     path = report_dir / 'tcpdump-client.pcap'
-    if not path.exists() or path.stat().st_size == 0:
+    try:
+        available = path.is_file() and path.stat().st_size > 0
+    except OSError:
+        available = False
+    if not available:
         return {'status': 'unavailable', 'source': 'no readable client pcap',
-                'syn': None, 'syn_ack': None, 'rst': None, 'handshakes': 'unknown'}
-    result = run(['tcpdump', '-nn', '-tt', '-r', str(path)], check=False)
+                'syn': None, 'syn_ack': None, 'rst': None,
+                'outgoing_syn_payload': None, 'handshakes': 'unknown'}
+    try:
+        result = run(['tcpdump', '-nn', '-tt', '-r', str(path)], check=False, timeout=30)
+    except ProbeError:
+        return {'status': 'unavailable', 'source': 'tcpdump read timed out or failed',
+                'syn': None, 'syn_ack': None, 'rst': None,
+                'outgoing_syn_payload': None, 'handshakes': 'unknown'}
     if result.returncode:
         return {'status': 'unavailable', 'source': 'tcpdump could not read pcap',
-                'syn': None, 'syn_ack': None, 'rst': None, 'handshakes': 'unknown'}
-    counts = {'syn': 0, 'syn_ack': 0, 'rst': 0}
+                'syn': None, 'syn_ack': None, 'rst': None,
+                'outgoing_syn_payload': None, 'handshakes': 'unknown'}
+    counts = {'syn': 0, 'syn_ack': 0, 'rst': 0, 'outgoing_syn_payload': 0}
     target = re.escape(cfg['TARGET_IP']) + r'\.' + str(cfg['TARGET_PORT'])
     for line in result.stdout.splitlines():
         if not re.search(target, line):
@@ -421,8 +544,31 @@ def packet_counts(report_dir, cfg):
             counts['syn_ack'] += 1
         elif 'S' in token:
             counts['syn'] += 1
+            if re.search(r'>\s*' + target + r':', line):
+                length = re.search(r'\blength (\d+)\s*$', line)
+                if length and int(length.group(1)) > 0:
+                    counts['outgoing_syn_payload'] += 1
     return {'status': 'observed', 'source': 'client tcpdump pcap; TCP flags, retransmissions included',
             **counts, 'handshakes': 'unknown'}
+
+
+def interception_evidence(queue_packets, log_path, packets):
+    try:
+        lines = log_path.read_text(errors='replace').splitlines()
+    except OSError:
+        lines = []
+    seen = sum(line.startswith('packet: id=') for line in lines)
+    invoked = sum(bool(re.search(r'\bsyndata:\s', line)) for line in lines)
+    payload = packets.get('outgoing_syn_payload')
+    return {'nfqueue_rule_packets': queue_packets,
+            'nfqueue_hit': None if queue_packets is None else queue_packets > 0,
+            'nfqws_packets_logged': seen if lines else None,
+            'syndata_invocations_logged': invoked if lines else None,
+            'nfqws_action_observed': None if not lines else invoked > 0,
+            'outgoing_syn_payload_packets': payload,
+            'outgoing_syn_payload_observed': None if payload is None else payload > 0,
+            'modified_packet_confirmed': False,
+            'attribution_limit': 'client pcap can show outgoing SYN payload but cannot prove wire delivery or exclusive nfqws attribution'}
 
 
 def latest_baseline(cfg):
@@ -460,31 +606,34 @@ def do_baseline(cfg, *, steps=None):
     try:
         cap = start_capture(cfg, directory)
         if steps is None:
-            attempts = connect_attempts(cfg)
+            attempts = connect_attempts(cfg, journal=directory / 'attempts.live.jsonl')
         else:
             deadline = time.time() + cfg['ADAPTIVE_DURATION_SECONDS']
-            adaptive.execute(cfg, steps, 'baseline', directory, attempts, deadline)
+            monotonic_deadline = time.monotonic() + cfg['ADAPTIVE_DURATION_SECONDS']
+            adaptive.execute(cfg, steps, 'baseline', directory, attempts, deadline,
+                             monotonic_deadline=monotonic_deadline)
     except (ProbeError, OSError) as exc:
         errors.append(str(exc))
+    except Exception as exc:
+        errors.append(f'unexpected {type(exc).__name__}: {exc}')
     finally:
-        finish_capture(cap)
+        try:
+            finish_capture(cap)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f'capture shutdown failed: {exc}')
         try:
             snapshot(directory / 'firewall-after.txt')
         except (ProbeError, OSError) as exc:
             errors.append(f'firewall after snapshot unavailable: {exc}')
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
-    after = directory / 'firewall-after.txt'
-    nft_before = directory / 'firewall-before.nft.txt'
-    nft_after = directory / 'firewall-after.nft.txt'
+    integrity = firewall_integrity(directory)
     data = {'target_ip': cfg['TARGET_IP'], 'target_port': cfg['TARGET_PORT'],
             'start': info['start'], 'end': utc_now(), 'attempts': attempts,
             'packets': packet_counts(directory, cfg),
             'errors': errors,
-            'firewall_changed': ((directory / 'firewall-before.txt').read_bytes() != after.read_bytes()
-                                 or (nft_before.exists() and nft_after.exists()
-                                     and nft_before.read_bytes() != nft_after.read_bytes()))
-            if after.exists() and (not nft_before.exists() or nft_after.exists()) else 'unknown'}
+            'firewall_changed': integrity['foreign_rules_changed'],
+            'firewall_integrity': integrity}
     if steps is not None:
         data['adaptive_plan'] = steps
         data['adaptive_analysis'] = adaptive.analyze(attempts, cfg['TARGET_PORT'])
@@ -538,29 +687,40 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
     rule = exact_rule(cfg, run_id)
     deadline = time.time() + (cfg['ADAPTIVE_DURATION_SECONDS'] if steps is not None
                               else cfg['TEST_DURATION_SECONDS'])
+    monotonic_deadline = time.monotonic() + (cfg['ADAPTIVE_DURATION_SECONDS'] if steps is not None
+                                              else cfg['TEST_DURATION_SECONDS'])
     state = {'run_id': run_id, 'rule': rule, 'report_dir': str(directory),
-             'deadline_epoch': deadline, 'nfq_pid': None, 'nfq_starttime': None,
+             'deadline_epoch': deadline, 'deadline_monotonic': monotonic_deadline,
+             'nfq_pid': None, 'nfq_starttime': None,
              'capture_pid': None, 'capture_starttime': None,
              'queue': cfg['NFQUEUE_NUM'], 'phase': 'armed'}
+    old_handlers = {}
+    def interrupted(signum, frame):
+        raise ProbeError(f'interrupted by signal {signum}')
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[sig] = signal.signal(sig, interrupted)
     # State and watchdog precede every firewall mutation.
-    with locked():
-        if STATE_FILE.exists():
-            raise ProbeError('parallel experiment detected')
-        write_json(STATE_FILE, state)
     try:
+        with locked():
+            if STATE_FILE.exists():
+                raise ProbeError('parallel experiment detected')
+            write_json(STATE_FILE, state)
         with (directory / 'watchdog.log').open('a') as watchdog_log:
             watchdog_proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
                                               '_watchdog', '--run-id', run_id],
                                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                              stderr=watchdog_log, start_new_session=True, close_fds=True)
-    except OSError:
-        cleanup(run_id)
+        await_watchdog_ready(watchdog_proc, run_id)
+    except BaseException:
+        try:
+            cleanup(run_id)
+        finally:
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
         raise
-    if watchdog_proc.poll() is not None:
-        cleanup(run_id)
-        raise ProbeError('watchdog failed to start')
     process = None
     capture = None
+    rule_was_installed = False
     outcome = {'start': utc_now(), 'target_ip': cfg['TARGET_IP'],
                'target_port': cfg['TARGET_PORT'], 'queue': cfg['NFQUEUE_NUM'],
                'strategy': '--lua-desync=syndata',
@@ -568,15 +728,12 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
                'attempts': [], 'errors': []}
     if steps is not None:
         outcome['adaptive_plan'] = steps
-    old_handlers = {}
-    def interrupted(signum, frame):
-        raise ProbeError(f'interrupted by signal {signum}')
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        old_handlers[sig] = signal.signal(sig, interrupted)
+    outcome['status'] = 'in_progress'
     try:
+        write_json(directory / 'experiment.json', outcome)
         with locked():
             state = read_json(STATE_FILE)
-            if state['run_id'] != run_id or time.time() >= deadline:
+            if state['run_id'] != run_id or time.time() >= deadline or time.monotonic() >= monotonic_deadline:
                 raise ProbeError('experiment expired or state changed before nfqws2 start')
             with (directory / 'nfqws-debug.log').open('w') as log:
                 process = subprocess.Popen(nfq_args(cfg), stdout=log, stderr=subprocess.STDOUT,
@@ -586,15 +743,11 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
                 raise ProbeError('cannot identify nfqws2 process')
             state.update(nfq_pid=process.pid, nfq_starttime=starttime, phase='nfqws-running')
             write_json(STATE_FILE, state)
-        time.sleep(0.4)
-        if process.poll() is not None:
-            raise ProbeError('nfqws2 exited before queue setup; see nfqws-debug.log')
-        if queue_conflict(cfg['NFQUEUE_NUM'], read_rules=False) is None:
-            raise ProbeError('nfqws2 did not bind the expected NFQUEUE')
+        await_nfqws_queue_ready(process, cfg['NFQUEUE_NUM'], directory / 'nfqws-debug.log')
         outcome['nfqueue_listener_observed'] = True
         with locked():
             state = read_json(STATE_FILE)
-            if state['run_id'] != run_id or time.time() >= deadline:
+            if state['run_id'] != run_id or time.time() >= deadline or time.monotonic() >= monotonic_deadline:
                 raise ProbeError('experiment expired before capture start')
             capture = start_capture(cfg, directory)
             if capture:
@@ -602,36 +755,54 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
                 write_json(STATE_FILE, state)
         with locked():
             state = read_json(STATE_FILE)
-            if state['run_id'] != run_id or time.time() >= deadline:
+            if state['run_id'] != run_id or time.time() >= deadline or time.monotonic() >= monotonic_deadline:
                 raise ProbeError('experiment expired before firewall installation')
-            if watchdog_proc.poll() is not None:
-                raise ProbeError('watchdog exited before firewall installation')
+            if watchdog_proc.poll() is not None or not watchdog_ready_path(run_id).exists():
+                raise ProbeError('watchdog is unavailable before firewall installation')
             ipt('-I', rule)
+            rule_was_installed = True
             if not rule_present(rule):
                 raise ProbeError('experimental rule was not installed')
             state['phase'] = 'rule-installed'
             write_json(STATE_FILE, state)
         if steps is None:
-            outcome['attempts'] = connect_attempts(cfg, deadline)
+            outcome['attempts'] = connect_attempts(
+                cfg, deadline, journal=directory / 'attempts.live.jsonl',
+                monotonic_deadline=monotonic_deadline)
         else:
-            adaptive.execute(cfg, steps, 'syndata', directory, outcome['attempts'], deadline)
-        counters = run(['iptables', '-t', 'mangle', '-nvxL', 'OUTPUT'], check=False).stdout
-        (directory / 'queue-counters.txt').write_text(counters)
-        match = next((x for x in counters.splitlines() if f'3b-syn-probe-{run_id}' in x), None)
-        outcome['queue_rule_packets'] = int(match.split()[0]) if match and match.split()[0].isdigit() else None
-        if outcome['queue_rule_packets'] is None:
-            outcome['errors'].append('NFQUEUE rule packet counter unavailable; interception is unverified')
-        elif outcome['queue_rule_packets'] == 0:
-            outcome['errors'].append('No packets reached the experimental NFQUEUE rule')
+            adaptive.execute(cfg, steps, 'syndata', directory, outcome['attempts'], deadline,
+                             monotonic_deadline=monotonic_deadline)
     except (ProbeError, OSError) as exc:
         outcome['errors'].append(str(exc))
+    except Exception as exc:
+        outcome['errors'].append(f'unexpected {type(exc).__name__}: {exc}')
+        raise
     finally:
-        finish_capture(capture)
+        if rule_was_installed:
+            try:
+                counters_result = run(['iptables', '-t', 'mangle', '-nvxL', 'OUTPUT'], check=False)
+                (directory / 'queue-counters.txt').write_text(counters_result.stdout)
+                match = next((x for x in counters_result.stdout.splitlines()
+                              if f'3b-syn-probe-{run_id}' in x), None)
+                outcome['queue_rule_packets'] = (int(match.split()[0])
+                                                 if counters_result.returncode == 0 and match
+                                                 and match.split()[0].isdigit() else None)
+            except (ProbeError, OSError) as exc:
+                outcome['queue_rule_packets'] = None
+                outcome['errors'].append(f'NFQUEUE counter read failed: {exc}')
+            if outcome['queue_rule_packets'] is None:
+                outcome['errors'].append('NFQUEUE rule packet counter unavailable; interception is unverified')
+            elif outcome['queue_rule_packets'] == 0:
+                outcome['errors'].append('No packets reached the experimental NFQUEUE rule')
+        try:
+            finish_capture(capture)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            outcome['errors'].append(f'capture shutdown failed: {exc}')
         try:
             outcome['rollback'] = cleanup(run_id)
             if outcome['rollback']['rollback'] == 'not needed' and (directory / 'rollback.json').exists():
                 outcome['rollback'] = read_json(directory / 'rollback.json')
-        except (ProbeError, OSError, BlockingIOError) as exc:
+        except (ProbeError, OSError, BlockingIOError, ValueError, KeyError) as exc:
             outcome['rollback'] = {'rollback': 'failed', 'rule_remaining': 'unknown', 'errors': [str(exc)]}
         try:
             snapshot(directory / 'firewall-after.txt')
@@ -639,15 +810,26 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
             outcome['errors'].append(f'firewall after snapshot unavailable: {exc}')
         outcome['end'] = utc_now()
         outcome['packets'] = packet_counts(directory, cfg)
+        outcome['firewall_integrity'] = firewall_integrity(
+            directory, own_rule_remaining=outcome['rollback'].get('rule_remaining', 'unknown'))
+        outcome['interception_evidence'] = interception_evidence(
+            outcome.get('queue_rule_packets'), directory / 'nfqws-debug.log', outcome['packets'])
         if steps is not None:
             outcome['adaptive_analysis'] = adaptive.analyze(outcome['attempts'], cfg['TARGET_PORT'])
         if (directory / 'nfqws-debug.log').exists():
-            lines = (directory / 'nfqws-debug.log').read_text(errors='replace').splitlines()
-            outcome['nfqws_errors'] = [x for x in lines if re.search(r'error|fail|not permitted', x, re.I)][-30:]
-        write_json(directory / 'experiment.json', outcome)
-        generate_report(directory, cfg)
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
+            try:
+                lines = (directory / 'nfqws-debug.log').read_text(errors='replace').splitlines()
+                outcome['nfqws_errors'] = [x for x in lines if re.search(r'error|fail|not permitted', x, re.I)][-30:]
+            except OSError as exc:
+                outcome['errors'].append(f'nfqws2 log unavailable: {exc}')
+        outcome['status'] = ('completed' if not outcome['errors']
+                             and outcome['rollback'].get('rollback') == 'complete' else 'partial')
+        try:
+            write_json(directory / 'experiment.json', outcome)
+            generate_report(directory, cfg)
+        finally:
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
     print(directory)
     if outcome['errors'] or outcome['rollback'].get('rollback') != 'complete':
         raise ProbeError('experiment had errors; inspect report and rollback.json')
