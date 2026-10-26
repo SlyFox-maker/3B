@@ -2,6 +2,7 @@ import json
 import contextlib
 import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import time
@@ -65,6 +66,141 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn('referenced', probe.queue_conflict(129))
 
 
+class RuntimeLuaTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        source = self.base / 'source'
+        source.mkdir()
+        (source / 'zapret-lib.lua').write_text('return true\n')
+        (source / 'zapret-antidpi.lua').write_text('return true\n')
+        self.patches = [mock.patch.object(probe, 'STATE_DIR', self.base / 'runroot/private'),
+                        mock.patch.object(probe, 'STATE_FILE', self.base / 'runroot/private/state.json'),
+                        mock.patch.object(probe, 'LOCK_FILE', self.base / 'runroot/private/lock'),
+                        mock.patch.object(probe, 'LUA_LIB', source / 'zapret-lib.lua'),
+                        mock.patch.object(probe, 'LUA_ANTIDPI', source / 'zapret-antidpi.lua')]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.cfg = probe.parse_env(probe.DEFAULTS)
+
+    def test_runtime_lua_readable_while_state_and_watchdog_remain_private(self):
+        source_modes = [stat.S_IMODE(path.stat().st_mode) for path in
+                        (probe.LUA_LIB, probe.LUA_ANTIDPI)]
+        directory = probe.prepare_lua_runtime()
+        try:
+            self.assertEqual(stat.S_IMODE(probe.STATE_DIR.parent.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(probe.STATE_DIR.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(probe.runtime_root().stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+            for name in ('zapret-lib.lua', 'zapret-antidpi.lua'):
+                self.assertEqual(stat.S_IMODE((directory / name).stat().st_mode), 0o644)
+            probe.write_json(probe.STATE_FILE, {'run_id': 'test'})
+            probe.write_json(probe.watchdog_ready_path('test'), {'run_id': 'test'})
+            self.assertEqual(stat.S_IMODE(probe.STATE_FILE.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(probe.watchdog_ready_path('test').stat().st_mode), 0o600)
+            with probe.locked():
+                self.assertEqual(stat.S_IMODE(probe.LOCK_FILE.stat().st_mode), 0o600)
+        finally:
+            probe.remove_lua_runtime(directory)
+        self.assertFalse(directory.exists())
+        self.assertTrue(probe.STATE_FILE.exists())
+        self.assertEqual(source_modes, [stat.S_IMODE(path.stat().st_mode) for path in
+                                        (probe.LUA_LIB, probe.LUA_ANTIDPI)])
+
+    def test_real_launch_arguments_use_runtime_lua_only(self):
+        directory = probe.prepare_lua_runtime()
+        try:
+            args = probe.nfq_args(self.cfg, lua_dir=directory)
+            self.assertIn(f'--lua-init=@{directory / probe.LUA_LIB.name}', args)
+            self.assertIn(f'--lua-init=@{directory / probe.LUA_ANTIDPI.name}', args)
+            self.assertNotIn(f'--lua-init=@{probe.LUA_LIB}', args)
+            with self.assertRaisesRegex(probe.ProbeError, 'prepared Lua runtime'):
+                probe.nfq_args(self.cfg)
+        finally:
+            probe.remove_lua_runtime(directory)
+
+    def test_doctor_dry_run_uses_runtime_copies_and_cleans_them(self):
+        calls = []
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if '--dry-run' in args:
+                lua_paths = [Path(arg.split('@', 1)[1]) for arg in args if arg.startswith('--lua-init=@')]
+                self.assertEqual(len(lua_paths), 2)
+                self.assertTrue(all(path.exists() and path.parent.parent == probe.runtime_root()
+                                    for path in lua_paths))
+                self.assertIn('--intercept=0', args)
+                return mock.Mock(returncode=0, stdout='command line parameters verified')
+            return mock.Mock(returncode=0, stdout='iptables v1.8.9 (legacy)')
+        with mock.patch.object(probe, 'binary_check', return_value='v1.0.4'), \
+             mock.patch.object(probe.shutil, 'which', side_effect=lambda command: command), \
+             mock.patch.object(probe, 'run', side_effect=fake_run):
+            self.assertEqual(probe.readiness(self.cfg), 'v1.0.4')
+        self.assertTrue(any('--dry-run' in args for args in calls))
+        self.assertFalse(list(probe.runtime_root().glob('lua-*')))
+        self.assertFalse(any('-I' in args or '-D' in args for args in calls))
+
+    def test_doctor_command_does_not_call_firewall_mutation(self):
+        with mock.patch.object(probe, 'readiness', return_value='v1.0.4'), \
+             mock.patch.object(probe, 'route_info', return_value={}), \
+             mock.patch.object(probe, 'queue_conflict', return_value=None), \
+             mock.patch.object(probe, 'management_info', return_value={}), \
+             mock.patch.object(probe, 'run', return_value=mock.Mock(stdout='iptables v1.8.9')), \
+             mock.patch.object(probe, 'ipt') as ipt:
+            probe.do_doctor(self.cfg)
+        ipt.assert_not_called()
+
+    def test_failed_lua_load_or_missing_source_cleans_runtime(self):
+        with mock.patch.object(probe, 'binary_check', return_value='v1.0.4'), \
+             mock.patch.object(probe.shutil, 'which', side_effect=lambda command: command), \
+             mock.patch.object(probe, 'run', return_value=mock.Mock(
+                 returncode=1, stdout='LUA file not accessible')):
+            with self.assertRaisesRegex(probe.ProbeError, 'LUA file not accessible'):
+                probe.readiness(self.cfg)
+        self.assertFalse(list(probe.runtime_root().glob('lua-*')))
+        with mock.patch.object(probe, 'binary_check', return_value='v1.0.4'), \
+             mock.patch.object(probe.shutil, 'which', side_effect=lambda command: command), \
+             mock.patch.object(probe, 'run', return_value=mock.Mock(
+                 returncode=0, stdout='LUA file not accessible')):
+            with self.assertRaisesRegex(probe.ProbeError, 'LUA file not accessible'):
+                probe.readiness(self.cfg)
+        self.assertFalse(list(probe.runtime_root().glob('lua-*')))
+        with mock.patch.object(probe, 'LUA_ANTIDPI', self.base / 'missing.lua'):
+            with self.assertRaisesRegex(probe.ProbeError, 'missing'):
+                probe.prepare_lua_runtime()
+        self.assertFalse(list(probe.runtime_root().glob('lua-*')))
+
+    def test_refuses_exposed_private_state_directory(self):
+        probe.STATE_DIR.mkdir(parents=True, mode=0o700)
+        probe.STATE_DIR.chmod(0o755)
+        with self.assertRaisesRegex(probe.ProbeError, 'unsafe private state directory'):
+            probe.prepare_lua_runtime()
+
+    def test_legacy_active_state_blocks_runtime_until_stopped(self):
+        root = probe.STATE_DIR.parent
+        root.mkdir(mode=0o700)
+        (root / 'state.json').write_text('{}')
+        with self.assertRaisesRegex(probe.ProbeError, 'legacy SYN Probe state'):
+            probe.prepare_lua_runtime()
+        self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+
+    def test_stop_can_clean_legacy_exact_rule(self):
+        root = probe.STATE_DIR.parent
+        root.mkdir(mode=0o700)
+        report_dir = self.base / 'legacy-report'
+        report_dir.mkdir()
+        rule = probe.exact_rule(self.cfg, 'legacy')
+        probe.write_json(root / 'state.json', {'run_id': 'legacy', 'rule': rule,
+                                              'report_dir': str(report_dir)})
+        with mock.patch.object(probe, 'rule_present', side_effect=[True, False]), \
+             mock.patch.object(probe, 'ipt', return_value=True) as ipt, \
+             mock.patch.object(probe, 'stop_owned_process'):
+            self.assertEqual(probe.cleanup()['rollback'], 'complete')
+        ipt.assert_called_once_with('-D', rule)
+        self.assertFalse((root / 'state.json').exists())
+
+
 class IsolationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -120,6 +256,19 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(outcome['rollback'], 'complete')
         self.assertEqual(rules, [foreign])
         self.assertFalse(probe.STATE_FILE.exists())
+
+    def test_cleanup_removes_experiment_lua_runtime_after_owned_process(self):
+        self.state()
+        directory = probe.runtime_root() / 'lua-owned'
+        directory.mkdir(parents=True)
+        (directory / 'zapret-lib.lua').write_text('test')
+        state = probe.read_json(probe.STATE_FILE)
+        state['lua_runtime_dir'] = str(directory)
+        probe.write_json(probe.STATE_FILE, state)
+        with mock.patch.object(probe, 'rule_present', return_value=False), \
+             mock.patch.object(probe, 'stop_owned_process', return_value=True):
+            self.assertEqual(probe.cleanup('a1')['rollback'], 'complete')
+        self.assertFalse(directory.exists())
 
     def test_failed_rule_removal_keeps_state_for_retry(self):
         self.state()
@@ -234,6 +383,8 @@ class IsolationTests(unittest.TestCase):
                           mock.patch.object(probe, 'generate_report'),
                           mock.patch.object(probe, 'await_watchdog_ready'),
                           mock.patch.object(probe, 'watchdog_ready_path', return_value=ready),
+                          mock.patch.object(probe, 'prepare_lua_runtime', return_value=self.base / 'lua'),
+                          mock.patch.object(probe, 'remove_lua_runtime'),
                           mock.patch.object(probe.subprocess, 'Popen', side_effect=[watchdog, nfqws])]:
                 stack.enter_context(patch)
             insert = stack.enter_context(mock.patch.object(probe, 'ipt'))

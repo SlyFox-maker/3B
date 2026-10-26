@@ -184,6 +184,8 @@ class AdaptiveTests(unittest.TestCase):
                     mock.patch.object(probe, 'await_watchdog_ready'),
                     mock.patch.object(probe, 'await_nfqws_queue_ready'),
                     mock.patch.object(probe, 'watchdog_ready_path', return_value=base / 'ready'),
+                    mock.patch.object(probe, 'prepare_lua_runtime', return_value=base / 'lua'),
+                    mock.patch.object(probe, 'remove_lua_runtime'),
                     mock.patch.object(probe, 'stop_owned_process'),
                     mock.patch.object(probe, 'packet_counts', return_value={'handshakes': 'unknown'}),
                     mock.patch.object(probe, 'run', return_value=mock.Mock(returncode=0, stdout='')),

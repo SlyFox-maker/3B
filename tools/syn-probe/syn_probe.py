@@ -15,8 +15,10 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -24,7 +26,7 @@ import adaptive
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-STATE_DIR = Path('/run/3b-syn-probe')
+STATE_DIR = Path('/run/3b-syn-probe/private')
 STATE_FILE = STATE_DIR / 'state.json'
 LOCK_FILE = STATE_DIR / 'lock'
 REPORT_ROOT = ROOT / 'reports' / 'syn-probe'
@@ -61,7 +63,9 @@ def write_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + '.tmp.' + uuid.uuid4().hex)
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        handle.write(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
     os.replace(tmp, path)
 
 
@@ -135,14 +139,85 @@ def binary_check():
     return version[0]
 
 
-def nfq_args(cfg, *, dry=False):
+def runtime_root():
+    return STATE_DIR.parent / 'lua'
+
+
+def legacy_state_file():
+    return STATE_DIR.parent / 'state.json'
+
+
+def prepare_lua_runtime():
+    """Stage public Lua code away from a private home; keep state in private/."""
+    base = STATE_DIR.parent
+    if legacy_state_file().exists():
+        raise ProbeError('legacy SYN Probe state is active; run stop before doctor or test')
+    base.mkdir(mode=0o755, parents=True, exist_ok=True)
+    root_stat = base.lstat()
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.geteuid() \
+            or root_stat.st_mode & 0o022:
+        raise ProbeError(f'unsafe SYN Probe runtime directory: {base}')
+    # Do not expose files left by the previous 0700 layout when opening this parent.
+    for entry in base.iterdir():
+        if entry.name in (STATE_DIR.name, runtime_root().name):
+            continue
+        entry_stat = entry.lstat()
+        if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_uid != os.geteuid() \
+                or entry_stat.st_nlink != 1 or not (entry.name == 'lock'
+                                                    or entry.name.startswith('watchdog-')
+                                                    or entry.name.startswith('state.json.tmp.')):
+            raise ProbeError(f'unexpected legacy runtime entry: {entry}')
+        entry.chmod(0o600)
+        entry.unlink()
+    STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    private_stat = STATE_DIR.lstat()
+    if not stat.S_ISDIR(private_stat.st_mode) or private_stat.st_uid != os.geteuid() \
+            or private_stat.st_mode & 0o077:
+        raise ProbeError(f'unsafe private state directory: {STATE_DIR}')
+    lua_root = runtime_root()
+    lua_root.mkdir(mode=0o755, exist_ok=True)
+    lua_stat = lua_root.lstat()
+    if not stat.S_ISDIR(lua_stat.st_mode) or lua_stat.st_uid != os.geteuid() \
+            or lua_stat.st_mode & 0o022:
+        raise ProbeError(f'unsafe Lua runtime directory: {lua_root}')
+    base.chmod(0o755)
+    lua_root.chmod(0o755)
+    directory = Path(tempfile.mkdtemp(prefix='lua-', dir=lua_root))
+    try:
+        for source in (LUA_LIB, LUA_ANTIDPI):
+            if not source.is_file():
+                raise ProbeError(f'Zapret2 Lua file missing: {source}')
+            target = directory / source.name
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o644)
+        directory.chmod(0o755)
+        return directory
+    except BaseException:
+        shutil.rmtree(directory)
+        raise
+
+
+def remove_lua_runtime(directory):
+    if not directory:
+        return
+    path = Path(directory)
+    if path.parent != runtime_root() or not path.name.startswith('lua-') or path.is_symlink():
+        raise ProbeError(f'refusing to remove unexpected Lua runtime path: {path}')
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def nfq_args(cfg, *, dry=False, lua_dir=None):
+    if lua_dir is None:
+        raise ProbeError('nfqws2 requires a prepared Lua runtime directory')
     args = [str(BIN)]
     if dry:
         args += ['--dry-run', '--intercept=0']
     args += [f"--qnum={cfg['NFQUEUE_NUM']}", '--fwmark=0x20000000']
     if not dry:
         args += ['--uid=0:0', '--debug=1']
-    args += [f'--lua-init=@{LUA_LIB}', f'--lua-init=@{LUA_ANTIDPI}',
+    args += [f'--lua-init=@{Path(lua_dir) / LUA_LIB.name}',
+             f'--lua-init=@{Path(lua_dir) / LUA_ANTIDPI.name}',
              '--name=3b-syn-probe', f"--filter-tcp={cfg['TARGET_PORT']}",
              '--lua-desync=syndata']
     return args
@@ -225,19 +300,26 @@ def stop_owned_process(pid, starttime):
 
 
 @contextlib.contextmanager
-def locked():
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with LOCK_FILE.open('a+') as handle:
+def locked(lock_file=None):
+    path = Path(lock_file or LOCK_FILE)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, 'a+') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield
 
 
 def cleanup(run_id=None):
     """Remove only the exact rule and process recorded by this module."""
-    with locked():
-        if not STATE_FILE.exists():
+    state_file = STATE_FILE
+    lock_file = LOCK_FILE
+    if run_id is None and not state_file.exists() and legacy_state_file().exists():
+        state_file = legacy_state_file()
+        lock_file = state_file.parent / 'lock'
+    with locked(lock_file):
+        if not state_file.exists():
             return {'rollback': 'not needed', 'rule_remaining': False}
-        state = read_json(STATE_FILE)
+        state = read_json(state_file)
         if run_id is not None and state['run_id'] != run_id:
             return {'rollback': 'superseded', 'rule_remaining': False}
         rule = state['rule']
@@ -254,14 +336,21 @@ def cleanup(run_id=None):
                     errors.append(f'{kind} process survived termination')
             except OSError as exc:
                 errors.append(f'{kind} process termination failed: {exc}')
+        if not errors and not remaining:
+            try:
+                remove_lua_runtime(state.get('lua_runtime_dir'))
+            except (ProbeError, OSError) as exc:
+                errors.append(f'Lua runtime cleanup failed: {exc}')
         result = {'rollback': 'failed' if errors or remaining else 'complete',
                   'rule_remaining': remaining, 'errors': errors, 'at': utc_now()}
         report_dir = Path(state['report_dir'])
         write_json(report_dir / 'rollback.json', result)
         if not errors and not remaining:
-            STATE_FILE.unlink(missing_ok=True)
+            state_file.unlink(missing_ok=True)
             with contextlib.suppress(OSError):
-                watchdog_ready_path(state['run_id']).unlink(missing_ok=True)
+                ready = (watchdog_ready_path(state['run_id']) if state_file == STATE_FILE
+                         else state_file.parent / f"watchdog-{state['run_id']}.ready.json")
+                ready.unlink(missing_ok=True)
         return result
 
 
@@ -334,7 +423,9 @@ def watchdog(run_id):
                 return 0
         except (ProbeError, OSError, BlockingIOError, ValueError, KeyError) as exc:
             with contextlib.suppress(OSError):
-                with (STATE_DIR / f'watchdog-{run_id}.log').open('a') as log:
+                path = STATE_DIR / f'watchdog-{run_id}.log'
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                with os.fdopen(descriptor, 'a') as log:
                     log.write(f'{utc_now()} rollback retry: {exc}\n')
         # A concurrent cleanup or temporary firewall error must not abandon rollback.
         time.sleep(1)
@@ -361,8 +452,12 @@ def readiness(cfg, *, require_root=False, check_nfqws=True):
         raise ProbeError('ENABLE_PACKET_CAPTURE=true requires tcpdump')
     if check_nfqws:
         version = binary_check()
-        dry = run(nfq_args(cfg, dry=True), check=False)
-        if dry.returncode:
+        lua_dir = prepare_lua_runtime()
+        try:
+            dry = run(nfq_args(cfg, dry=True, lua_dir=lua_dir), check=False)
+        finally:
+            remove_lua_runtime(lua_dir)
+        if dry.returncode or 'command line parameters verified' not in dry.stdout:
             raise ProbeError(f'nfqws2 rejected syndata preflight: {dry.stdout[-1200:]}')
         return version
     return None
@@ -584,7 +679,7 @@ def latest_baseline(cfg):
 
 def do_baseline(cfg, *, steps=None):
     readiness(cfg, require_root=True, check_nfqws=False)
-    if STATE_FILE.exists():
+    if STATE_FILE.exists() or legacy_state_file().exists():
         raise ProbeError('SYN Probe experiment is active; baseline would be contaminated')
     directory = new_report_dir()
     snapshot(directory / 'firewall-before.txt')
@@ -671,7 +766,7 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
         raise ProbeError('target rule would match current SSH management connection')
     if ssh_target_conflict(cfg):
         raise ProbeError('target endpoint appears in an established SSH connection')
-    if STATE_FILE.exists():
+    if STATE_FILE.exists() or legacy_state_file().exists():
         raise ProbeError('another SYN Probe state exists; inspect status or stop first')
     conflict = queue_conflict(cfg['NFQUEUE_NUM'])
     if conflict:
@@ -720,6 +815,7 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
         raise
     process = None
     capture = None
+    lua_dir = None
     rule_was_installed = False
     outcome = {'start': utc_now(), 'target_ip': cfg['TARGET_IP'],
                'target_port': cfg['TARGET_PORT'], 'queue': cfg['NFQUEUE_NUM'],
@@ -731,12 +827,16 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
     outcome['status'] = 'in_progress'
     try:
         write_json(directory / 'experiment.json', outcome)
+        lua_dir = prepare_lua_runtime()
         with locked():
             state = read_json(STATE_FILE)
             if state['run_id'] != run_id or time.time() >= deadline or time.monotonic() >= monotonic_deadline:
                 raise ProbeError('experiment expired or state changed before nfqws2 start')
+            state['lua_runtime_dir'] = str(lua_dir)
+            write_json(STATE_FILE, state)
             with (directory / 'nfqws-debug.log').open('w') as log:
-                process = subprocess.Popen(nfq_args(cfg), stdout=log, stderr=subprocess.STDOUT,
+                process = subprocess.Popen(nfq_args(cfg, lua_dir=lua_dir), stdout=log,
+                                           stderr=subprocess.STDOUT,
                                            start_new_session=True)
             starttime = proc_starttime(process.pid)
             if not starttime:
@@ -804,6 +904,11 @@ def do_test(cfg, args, *, steps=None, baseline_file=None, confirmed=False):
                 outcome['rollback'] = read_json(directory / 'rollback.json')
         except (ProbeError, OSError, BlockingIOError, ValueError, KeyError) as exc:
             outcome['rollback'] = {'rollback': 'failed', 'rule_remaining': 'unknown', 'errors': [str(exc)]}
+        if lua_dir and outcome['rollback'].get('rollback') in ('complete', 'not needed'):
+            try:
+                remove_lua_runtime(lua_dir)
+            except (ProbeError, OSError) as exc:
+                outcome['errors'].append(f'Lua runtime cleanup failed: {exc}')
         try:
             snapshot(directory / 'firewall-after.txt')
         except (ProbeError, OSError) as exc:
@@ -920,10 +1025,11 @@ def main():
     if args.command == '_watchdog':
         return watchdog(args.run_id)
     if args.command == 'status':
-        if not STATE_FILE.exists():
+        state_file = STATE_FILE if STATE_FILE.exists() else legacy_state_file()
+        if not state_file.exists():
             print('No active SYN Probe experiment')
         else:
-            state = read_json(STATE_FILE)
+            state = read_json(state_file)
             print(json.dumps({**state, 'rule_present': rule_present(state['rule']),
                               'process_alive': proc_starttime(state.get('nfq_pid')) == state.get('nfq_starttime')
                               if state.get('nfq_pid') else False}, indent=2))
